@@ -35,6 +35,8 @@ geometry:
 projector:
   method: joseph3d     #joseph3d|siddon3d
   angle_chunk: 4
+  step_chunk: 2
+  c_chunk: 2
   joseph:
     n_steps_cap: 16
   psf:
@@ -44,7 +46,7 @@ cheat:
   enabled: true
   # aggregate: angle_mean
   # dft_K: 2
-  gate: 0.9
+  gate: 0.35
   train_only: true
   psf_consistent: false
 
@@ -52,8 +54,8 @@ model:
   enc1: { base: 8, depth: 2 }
   enc2: { base: 8, depth: 2, harm_K: 2 }
   enc3: { enabled: false, base: 8, depth: 2 }
-  align: { out_ch: 32, bp_ch: 8 }
-  dec:   { mid_ch: 32, n_proj_ch: 2 }
+  align: { out_ch: 16, bp_ch: 2 }
+  dec:   { mid_ch: 16, n_proj_ch: 2 }
 
 losses:
   renorm: true
@@ -78,17 +80,17 @@ train:
   batch_size: 1
   grad_accum_steps: 1
   optimizer: adamw    # adamw/adafactor
-  lr: 1.0e-5
+  lr: 1.0e-4
   weight_decay: 0.0
   amp: true
   amp_dtype: auto         # auto/bf16/fp16/fp32
   tf32: true
   grad_clip: 1.0
-  num_workers: 4
-  prefetch_factor: 2
-  persistent_workers: true
+  num_workers: 2
+  prefetch_factor: 1
+  persistent_workers: false
   compile: false
-  flush_every: 50
-  empty_cache_every: 200
+  flush_every: 1
+  empty_cache_every: 2
   ckpt_dir: results/ckpt
   ckpt_interval: 1

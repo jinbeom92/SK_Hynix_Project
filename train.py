@@ -252,6 +252,10 @@ def train_shared_model(cfg: Dict[str, Any]):
             S_in = batch["sino"].to(device, non_blocking=True)                # [B,A,V,U]
             angles_b = batch["angles"].to(device, non_blocking=True)
             V_gt = batch["voxel"].to(device, non_blocking=True).unsqueeze(1)  # [B,1,D,H,W]
+            print(f"Processing {batch['id']}")
+            print("sino min", float(S_in.min()), "max", float(S_in.max()))
+            print("voxel min", float(V_gt.min()), "max", float(V_gt.max()))
+
 
             # Per-batch geometry rebind (one model for all resolutions)
             B, A, V, U = S_in.shape
