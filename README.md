@@ -1,6 +1,6 @@
-# SK Hynix Project — High-Dimensional Neural Tomographic Reconstruction
+# SVTR — Sinogram-to-Volume Tomographic Reconstruction
 
-This repository provides a **PyTorch-based framework** for high-dimensional neural (HDN) tomographic reconstruction.  
+This repository provides a **PyTorch-based framework** for high-dimensional neural (HDN-inspired) tomographic reconstruction.  
 The system eliminates traditional FBP from the training path and directly optimizes sinograms to produce physically consistent 3D reconstructions.
 
 ---
@@ -21,8 +21,8 @@ The system eliminates traditional FBP from the training path and directly optimi
 - **Decoder**
   - `DecoderSlice2D`: processes fused features with multiple convolutional blocks and a 1×1 projection, outputting a single voxel slice.
 
-- **HDNSystem**
-  - The `HDNSystem` class (`models/hdn.py`) combines the above modules into the forward pipeline:
+- **SVTR System**
+  - The `SVTRSystem` (implemented in `models/hdn.py`) combines the above modules into the forward pipeline:
     1. Extracts features via 1D/2D encoders.
     2. Aligns them to the voxel domain.
     3. Optionally applies cheat injection and fusion.
@@ -30,11 +30,11 @@ The system eliminates traditional FBP from the training path and directly optimi
 
 - **Optional 3D Encoder**
   - `Enc3_3D`: training-only prior that extracts hierarchical volumetric features from ground-truth 3D volumes.  
-    Not integrated into the default `HDNSystem`.
+    Not integrated into the default SVTR pipeline.
 
 - **Physics Modules**
   - `physics/projector.py` and `physics/geometry.py` implement forward/back projectors and acquisition geometry for 3D parallel-beam CT.  
-    As the README notes, these are not used in the default training loop but are available for testing or extended setups.
+    Currently not used in the default training loop, but available for testing or extended setups.
 
 ---
 
@@ -53,10 +53,10 @@ The system eliminates traditional FBP from the training path and directly optimi
 
 ```
 
-SK\_Hynix\_Project/
+SVTR/
 ├── train.py                  # Main training loop
 ├── config.yaml               # Training configuration
-├── models/                   # Encoders, Decoder, Fusion, HDNSystem
+├── models/                   # Encoders, Decoder, Fusion, SVTRSystem
 ├── physics/                  # Projector, Geometry, PSF
 ├── losses/                   # Loss functions
 ├── data/                     # Dataset loaders
@@ -71,9 +71,9 @@ SK\_Hynix\_Project/
 
 ## 📝 Key Notes
 
-- The **core architecture** (1D/2D encoders → alignment → cheat injection & fusion → decoder) is **fully implemented** and matches the README.  
-- The **volumetric encoder (`Enc3_3D`)** and **physics-based projector modules** are implemented but **not integrated into the default `HDNSystem` or training script**.  
-- Thus, by default, training proceeds with 1D/2D encoders, alignment, optional cheat injection, and decoding.
+- The **core architecture** (1D/2D encoders → alignment → cheat injection & fusion → decoder) is **fully implemented** and stable.  
+- The **3D encoder (`Enc3_3D`)** and **physics-based projector modules** are implemented but **not integrated into the default SVTR training loop**.  
+- Thus, by default, SVTR training proceeds with 1D/2D encoders, alignment, optional cheat injection, and decoding.
 
 ---
 
@@ -125,6 +125,18 @@ pytest tests/
 
 ---
 
+## 🔮 Planned Features
+
+These modules are implemented in prototype form but not yet supported in the default SVTR training path.
+They will be integrated in future updates:
+
+* **PSF (Point Spread Function):** separable Gaussian kernel, angle-dependent/invariant blurring.
+* **Forward Consistency Loss:** enforcing `FP(R_hat) ≈ S_in` as an additional physical constraint.
+* **3D Convolutions:** extending encoders/decoders with volumetric Conv3D layers for richer context.
+* **Physics-Based Models:** tighter integration of projectors and geometry into the SVTR training loop.
+
+---
+
 ## 🔒 Constraints
 
 * **FBP/FDK/iradon** are forbidden in training (allowed only for visualization/evaluation).
@@ -142,7 +154,6 @@ Inspired by:
 
 * HDN: *High-Dimensional Neural Tomographic Reconstruction* (paper reference).
 * ASTRA Toolbox forward/backprojection operators.
-
 ---
 ## 🧩 Architecture Diagram
 ```
