@@ -1,13 +1,3 @@
-# =================================================================================================
-# Reconstruction Loss Functions (2D/3D-safe)
-# -------------------------------------------------------------------------------------------------
-# Purpose:
-#   Composite voxel-domain losses for reconstructed vs. ground-truth volumes/slices.
-#
-# Supports:
-#   • 3D volumes [B,1,D,H,W]
-#   • 2D slices  [B,1,1,H,W]  (SSIM falls back to 2D window)
-# =================================================================================================
 import torch
 import torch.nn.functional as F
 from utils.metrics import psnr, band_penalty, energy_penalty, voxel_error_rate, in_positive_mask_dynamic_range

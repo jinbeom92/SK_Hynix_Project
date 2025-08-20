@@ -1,3 +1,62 @@
+# =================================================================================================
+# SVTR Configuration File (Example)
+# -------------------------------------------------------------------------------------------------
+# This configuration controls dataset loading, model architecture, training procedure, 
+# and loss function weighting for the Sinogram-to-Volume Tomographic Reconstruction (SVTR) system.
+#
+# Section overview:
+# - data:       dataset root path and glob patterns for sinograms/voxels
+# - model:      hyperparameters of the encoder, alignment, cheat-injection, fusion, and decoder modules
+# - train:      training loop settings (epochs, optimizer, AMP, checkpointing, etc.)
+# - losses:     weights and thresholds for composite reconstruction loss terms
+# =================================================================================================
+#
+# DATA
+#   root:        Path to dataset directory
+#   sino_glob:   Glob pattern for sinogram `.npy` files (detector × angle × depth)
+#   voxel_glob:  Glob pattern for voxel `.npy` files (X × Y × depth)
+#
+# MODEL
+#   enc1:        1D angle encoder → base channels + number of convolutional blocks
+#   enc2:        2D sino encoder → base channels + number of convolutional blocks
+#   align:       Align block → output channels, depth (#conv layers), interpolation mode
+#   cheat2d:     Cheat encoder (training only) → whether enabled, base channels, depth
+#   fusion:      Fusion block → output channels after combining sino + cheat features
+#   dec:         Decoder block → intermediate channels and depth (#conv layers)
+#
+# TRAIN
+#   seed:              RNG seed for reproducibility
+#   files_per_group:   Number of sino/voxel pairs to train per group before re-initializing loader
+#   epochs_per_group:  Epochs to run per group
+#   epochs:            Total epochs across all groups
+#   batch_size:        Training batch size
+#   lr:                Learning rate
+#   weight_decay:      L2 regularization coefficient
+#   optimizer:         Optimizer choice (adamw, adafactor, etc.)
+#   grad_accum_steps:  Number of steps to accumulate gradients before an update
+#   amp:               Enable Automatic Mixed Precision (FP16/FP32)
+#   amp_dtype:         AMP dtype policy ("auto" = let PyTorch decide)
+#   compile:           Use torch.compile() for graph optimization (PyTorch 2.x)
+#   num_workers:       Number of DataLoader worker processes
+#   ckpt_dir:          Directory where checkpoints and logs are saved
+#   flush_every:       CSV/log flush frequency (steps)
+#   empty_cache_every: Steps interval to clear CUDA cache
+#   grad_clip:         Maximum gradient norm (for stability)
+#   train_ratio:       Train/validation split ratio
+#
+# LOSSES
+#   weights:     Relative weights for each loss component
+#                - ssim   : structural similarity (reconstruction quality)
+#                - psnr   : peak signal-to-noise ratio
+#                - band   : penalty for intensity outside [band_low, band_high]
+#                - energy : penalty for mismatch in global energy
+#                - ver    : voxel error rate (binary voxel misclassification)
+#                - ipdr   : in-positive dynamic range loss
+#                - tv     : total variation regularizer
+#   band_low:    Lower bound for valid voxel intensities
+#   band_high:   Upper bound for valid voxel intensities
+#   ver_thr:     Threshold for voxel occupancy in VER computation
+# =================================================================================================
 data:
   root: dataset
   sino_glob: "sino/*_sino.npy"
