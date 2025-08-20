@@ -143,9 +143,9 @@ Inspired by:
 * HDN: *High-Dimensional Neural Tomographic Reconstruction* (paper reference).
 * ASTRA Toolbox forward/backprojection operators.
 
-```
+---
 ## 🧩 Architecture Diagram
-
+```
       Input Sinogram Slice (U×A)
                    │
          ┌─────────┴─────────┐
