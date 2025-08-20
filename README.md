@@ -146,7 +146,6 @@ Inspired by:
 ```
 ## 🧩 Architecture Diagram
 
-```bash
       Input Sinogram Slice (U×A)
                    │
          ┌─────────┴─────────┐
