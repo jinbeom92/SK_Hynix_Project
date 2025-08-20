@@ -1,59 +1,42 @@
 # =================================================================================================
-# Reconstruction Loss Functions
+# Reconstruction Loss Functions (2D/3D-safe)
 # -------------------------------------------------------------------------------------------------
 # Purpose:
-#   Provides a composite set of voxel-domain loss functions to evaluate the quality of reconstructed
-#   volumes relative to ground truth. These losses enforce structural fidelity, intensity accuracy,
-#   and physical plausibility while optionally adding smoothness regularization.
+#   Composite voxel-domain losses for reconstructed vs. ground-truth volumes/slices.
 #
-# Components:
-#   • SSIM (Structural Similarity, 3D):
-#       Encourages structural similarity between reconstructed and ground-truth volumes.
-#       Implemented via `utils.ssim3d.ssim3d`.
-#
-#   • PSNR (Peak Signal-to-Noise Ratio):
-#       Penalizes intensity mismatches; expressed as a loss term −PSNR/100.
-#       Implemented via `utils.metrics.psnr`.
-#
-#   • Band Penalty:
-#       Enforces voxel values to lie within a specified valid band [low, high].
-#       Implemented via `utils.metrics.band_penalty`.
-#
-#   • Energy Penalty:
-#       Matches total energy (sum of voxel values) between reconstruction and ground truth.
-#       Implemented via `utils.metrics.energy_penalty`.
-#
-#   • Voxel Error Rate (VER):
-#       Binary classification error of occupied voxels vs. ground truth at a given threshold.
-#       Implemented via `utils.metrics.voxel_error_rate`.
-#
-#   • In-Positive Dynamic Range (IPDR):
-#       Measures dynamic range consistency in regions above threshold.
-#       Implemented via `utils.metrics.in_positive_mask_dynamic_range`.
-#
-#   • TV (Total Variation, optional):
-#       Encourages smoothness/isotropy in reconstructed volumes. Weighted by `tv_weight`.
-#
-# Usage:
-#   loss_dict = reconstruction_losses(R_hat_n, V_gt_n, weights, params)
-#   where:
-#     - R_hat_n: normalized reconstructed volume [B,1,D,H,W] or [B,D,H,W].
-#     - V_gt_n : normalized ground truth volume [B,1,D,H,W] or [B,D,H,W].
-#     - weights: dict of loss weights (normalized externally to sum≈1).
-#     - params : dict with keys {"band_low","band_high","ver_thr","tv_weight"}.
-#
-# Returns:
-#   loss_dict: dictionary of individual losses plus:
-#       • "total_recon" — weighted sum of selected terms.
-#
-# Notes:
-#   • Shapes are internally normalized to [B,1,D,H,W].
-#   • TV loss is optional; set params["tv_weight"]>0 to enable.
-#   • Supports differentiability for gradient-based training.
+# Supports:
+#   • 3D volumes [B,1,D,H,W]
+#   • 2D slices  [B,1,1,H,W]  (SSIM falls back to 2D window)
 # =================================================================================================
 import torch
-from utils.ssim3d import ssim3d
+import torch.nn.functional as F
 from utils.metrics import psnr, band_penalty, energy_penalty, voxel_error_rate, in_positive_mask_dynamic_range
+from utils.ssim3d import ssim3d
+
+def _ssim_safe(R: torch.Tensor, V: torch.Tensor) -> torch.Tensor:
+    # If depth == 1, approximate with 2D SSIM on the slice
+    if R.shape[2] == 1 and V.shape[2] == 1:
+        # reshape to [B,1,H,W]
+        r2 = R[:, :, 0, :, :]
+        v2 = V[:, :, 0, :, :]
+        # simple 2D SSIM via avg pooling / variance (no external deps)
+        # window 7x7, padding 'replicate'
+        k = 7
+        pad = k // 2
+        def _moments(x):
+            mu = F.avg_pool2d(x, k, 1, pad, count_include_pad=False)
+            mu2 = mu * mu
+            sigma2 = F.avg_pool2d(x * x, k, 1, pad, count_include_pad=False) - mu2
+            return mu, sigma2
+        mu_x, sig2_x = _moments(r2)
+        mu_y, sig2_y = _moments(v2)
+        cov_xy = F.avg_pool2d(r2 * v2, k, 1, pad, count_include_pad=False) - mu_x * mu_y
+        C1, C2 = 0.01 ** 2, 0.03 ** 2
+        ssim_map = ((2 * mu_x * mu_y + C1) * (2 * cov_xy + C2)) / ((mu_x**2 + mu_y**2 + C1) * (sig2_x + sig2_y + C2) + 1e-12)
+        # return 1 - SSIM as loss term to match previous convention
+        return 1.0 - ssim_map.mean(dim=list(range(1, ssim_map.ndim)), keepdim=True)
+    else:
+        return ssim3d(R, V)
 
 def tv_isotropic_3d(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     dz = x[:, :, 1:, :, :] - x[:, :, :-1, :, :]
@@ -67,25 +50,32 @@ def reconstruction_losses(R_hat_n: torch.Tensor, V_gt_n: torch.Tensor, weights: 
     # Ensure shapes [B,1,D,H,W]
     if R_hat_n.ndim == 4: R_hat_n = R_hat_n.unsqueeze(1)
     if V_gt_n.ndim == 4: V_gt_n = V_gt_n.unsqueeze(1)
-    # 1 - SSIM
-    loss_dict["ssim"] = ssim3d(R_hat_n, V_gt_n)
+
+    # 1 - SSIM (3D or 2D fallback)
+    loss_dict["ssim"] = _ssim_safe(R_hat_n, V_gt_n)
+
     # -PSNR/100
     loss_dict["psnr"] = -psnr(torch.clamp(R_hat_n,0,1), torch.clamp(V_gt_n,0,1)) / 100.0
+
     # band penalty
     loss_dict["band"] = band_penalty(R_hat_n, params["band_low"], params["band_high"])
+
     # energy
     loss_dict["energy"] = energy_penalty(R_hat_n, V_gt_n)
+
     # VER
     loss_dict["ver"] = voxel_error_rate(R_hat_n, V_gt_n, params["ver_thr"])
+
     # IPDR
     loss_dict["ipdr"] = in_positive_mask_dynamic_range(R_hat_n, params["ver_thr"])
+
     # TV optional
     if params.get("tv_weight", 0.0) > 0:
         loss_dict["tv"] = tv_isotropic_3d(R_hat_n) * params["tv_weight"]
     else:
         loss_dict["tv"] = torch.zeros_like(loss_dict["ssim"])
 
-    # Weighted sum (weights are normalized to sum 1 outside)
+    # Weighted sum (weights are normalized outside)
     total = torch.zeros_like(loss_dict["ssim"])
     for k, w in weights.items():
         if k in loss_dict:
