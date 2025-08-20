@@ -4,31 +4,30 @@ data:
   voxel_glob: "voxel/*_voxel.npy"
 
 model:
-  enc1:   { base: 32, depth: 3 }
-  enc2:   { base: 32, depth: 3 }
-  align:  { out_ch: 64, depth: 2 }
-  align:  { out_ch: 64, depth: 2, interp_mode: bilinear }
-  cheat2d: { enabled: true, base: 16, depth: 2 }
-  fusion: { out_ch: 64 }
-  dec:    { mid_ch: 64, depth: 3 }
+  enc1:   { base: 64, depth: 8 }
+  enc2:   { base: 64, depth: 8 }
+  align:  { out_ch: 96, depth: 8, interp_mode: bilinear }
+  cheat2d: { enabled: true, base: 64, depth: 8 }
+  fusion: { out_ch: 128 }
+  dec:    { mid_ch: 128, depth: 8 }
 
 train:
   seed: 1337
-  files_per_group: 10
+  files_per_group: 100
   epochs_per_group: 1
-  epochs: 1
+  epochs: 5
   batch_size: 1
-  lr: 1.0e-3
+  lr: 5.0e-4
   weight_decay: 1.0e-4
   optimizer: "adamw"
   grad_accum_steps: 1
   amp: true
   amp_dtype: "auto"
   compile: false
-  num_workers: 0
-  ckpt_dir: "ckpt"
+  num_workers: 2
+  ckpt_dir: "results"
   flush_every: 100
-  empty_cache_every: 100
+  empty_cache_every: 200
   grad_clip: 1.0
   train_ratio: 0.9
 

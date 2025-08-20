@@ -151,7 +151,7 @@ def main(cfg_path: str):
         )
         dl = DataLoader(ds,
                         batch_size=int(cfg["train"]["batch_size"]),
-                        shuffle=False,
+                        shuffle=True,
                         num_workers=int(cfg["train"]["num_workers"]),
                         pin_memory=True)
 

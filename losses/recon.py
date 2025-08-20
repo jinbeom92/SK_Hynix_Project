@@ -47,38 +47,39 @@ def tv_isotropic_3d(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
 
 def reconstruction_losses(R_hat_n: torch.Tensor, V_gt_n: torch.Tensor, weights: dict, params: dict):
     loss_dict = {}
-    # Ensure shapes [B,1,D,H,W]
+    # shapes [B,1,D,H,W]
     if R_hat_n.ndim == 4: R_hat_n = R_hat_n.unsqueeze(1)
     if V_gt_n.ndim == 4: V_gt_n = V_gt_n.unsqueeze(1)
 
-    # 1 - SSIM (3D or 2D fallback)
+    # 1 - SSIM
     loss_dict["ssim"] = _ssim_safe(R_hat_n, V_gt_n)
 
-    # -PSNR/100
-    loss_dict["psnr"] = -psnr(torch.clamp(R_hat_n,0,1), torch.clamp(V_gt_n,0,1)) / 100.0
+    # PSNR in dB for logging
+    psnr_db = psnr(torch.clamp(R_hat_n,0,1), torch.clamp(V_gt_n,0,1))
+    loss_dict["psnr"] = psnr_db
 
-    # band penalty
+    # Normalized PSNR loss (higher PSNR → lower loss)
+    # Use a reference PSNR (e.g. 40 dB) to map to [0,1]
+    p_ref = float(params.get("psnr_ref", 40.0))
+    psnr_loss = torch.clamp((p_ref - psnr_db) / p_ref, min=0.0, max=1.0)
+    loss_dict["psnr_loss"] = psnr_loss
+
+    # Other penalties
     loss_dict["band"] = band_penalty(R_hat_n, params["band_low"], params["band_high"])
-
-    # energy
     loss_dict["energy"] = energy_penalty(R_hat_n, V_gt_n)
-
-    # VER
     loss_dict["ver"] = voxel_error_rate(R_hat_n, V_gt_n, params["ver_thr"])
-
-    # IPDR
     loss_dict["ipdr"] = in_positive_mask_dynamic_range(R_hat_n, params["ver_thr"])
-
-    # TV optional
     if params.get("tv_weight", 0.0) > 0:
         loss_dict["tv"] = tv_isotropic_3d(R_hat_n) * params["tv_weight"]
     else:
         loss_dict["tv"] = torch.zeros_like(loss_dict["ssim"])
 
-    # Weighted sum (weights are normalized outside)
+    # Total loss uses psnr_loss instead of raw psnr_db
     total = torch.zeros_like(loss_dict["ssim"])
     for k, w in weights.items():
-        if k in loss_dict:
+        if k == "psnr":
+            total = total + float(w) * loss_dict.get("psnr_loss", 0.0)
+        elif k in loss_dict:
             total = total + float(w) * loss_dict[k]
     loss_dict["total_recon"] = total
     return loss_dict
