@@ -1,66 +1,37 @@
-# =================================================================================================
-# SVTR Configuration File (Example)
-# -------------------------------------------------------------------------------------------------
-# This configuration controls dataset loading, model architecture, training procedure, 
-# and loss function weighting for the Sinogram-to-Volume Tomographic Reconstruction (SVTR) system.
+# =============================================================================
+# Example YAML configuration for HDN/SVTR training with pixel-level loss.
 #
-# Section overview:
-# - data:       dataset root path and glob patterns for sinograms/voxels
-# - model:      hyperparameters of the encoder, alignment, cheat-injection, fusion, and decoder modules
-# - train:      training loop settings (epochs, optimizer, AMP, checkpointing, etc.)
-# - losses:     weights and thresholds for composite reconstruction loss terms
-# =================================================================================================
+# This configuration uses the default dataset layout where sinograms have
+# shape [U, A, D] and voxels [X, Y, D]【511144253987820†L17-L23】.  Each item
+# returned by the dataset corresponds to a single depth slice: a sinogram
+# slice of size [U, A] and a voxel slice of size [1, X, Y]【511144253987820†L75-L99】.
 #
-# DATA
-#   root:        Path to dataset directory
-#   sino_glob:   Glob pattern for sinogram `.npy` files (detector × angle × depth)
-#   voxel_glob:  Glob pattern for voxel `.npy` files (X × Y × depth)
+# The ``losses.weights`` section includes a new ``l1`` weight which controls
+# the pixel-wise L1 loss.  During training, this L1 term is combined with
+# structural similarity (SSIM) and peak signal-to-noise ratio (PSNR) to
+# encourage accurate and stable reconstructions.  All weights are
+# automatically normalised to sum to 1.0 inside the training script.
 #
-# MODEL
-#   enc1:        1D angle encoder → base channels + number of convolutional blocks
-#   enc2:        2D sino encoder → base channels + number of convolutional blocks
-#   align:       Align block → output channels, depth (#conv layers), interpolation mode
-#   cheat2d:     Cheat encoder (training only) → whether enabled, base channels, depth
-#   fusion:      Fusion block → output channels after combining sino + cheat features
-#   dec:         Decoder block → intermediate channels and depth (#conv layers)
+# Set ``cheat2d.enabled`` to true or false depending on whether you want to
+# inject ground-truth voxel features during training.  When evaluating
+# (train_mode=False), cheat injection is disabled to avoid leaking GT
+# information【511144253987820†L75-L99】.
 #
-# TRAIN
-#   seed:              RNG seed for reproducibility
-#   files_per_group:   Number of sino/voxel pairs to train per group before re-initializing loader
-#   epochs_per_group:  Epochs to run per group
-#   epochs:            Total epochs across all groups
-#   batch_size:        Training batch size
-#   lr:                Learning rate
-#   weight_decay:      L2 regularization coefficient
-#   optimizer:         Optimizer choice (adamw, adafactor, etc.)
-#   grad_accum_steps:  Number of steps to accumulate gradients before an update
-#   amp:               Enable Automatic Mixed Precision (FP16/FP32)
-#   amp_dtype:         AMP dtype policy ("auto" = let PyTorch decide)
-#   compile:           Use torch.compile() for graph optimization (PyTorch 2.x)
-#   num_workers:       Number of DataLoader worker processes
-#   ckpt_dir:          Directory where checkpoints and logs are saved
-#   flush_every:       CSV/log flush frequency (steps)
-#   empty_cache_every: Steps interval to clear CUDA cache
-#   grad_clip:         Maximum gradient norm (for stability)
-#   train_ratio:       Train/validation split ratio
+# Forward-projection consistency can be enabled by setting ``fp`` to a
+# positive value; this will use the differentiable radon transform to
+# compare the predicted reconstruction's sinogram with the ground truth.
 #
-# LOSSES
-#   weights:     Relative weights for each loss component
-#                - ssim   : structural similarity (reconstruction quality)
-#                - psnr   : peak signal-to-noise ratio
-#                - band   : penalty for intensity outside [band_low, band_high]
-#                - energy : penalty for mismatch in global energy
-#                - ver    : voxel error rate (binary voxel misclassification)
-#                - ipdr   : in-positive dynamic range loss
-#                - tv     : total variation regularizer
-#   band_low:    Lower bound for valid voxel intensities
-#   band_high:   Upper bound for valid voxel intensities
-#   ver_thr:     Threshold for voxel occupancy in VER computation
-# =================================================================================================
+# References:
+# - ASTRA forward projection algorithm takes a projector and a volume
+#   and returns projection data【34246792875788†L36-L40】.
+# - VAMToolbox’s FBP stage introduces negative intensities which we
+#   clamp to [0,1] in the decoder【508774924062640†L39-L44】.
+# =============================================================================
 data:
   root: dataset
   sino_glob: "sino/*_sino.npy"
   voxel_glob: "voxel/*_voxel.npy"
+  resample_u: false
 
 model:
   enc1:   { base: 64, depth: 8 }
@@ -69,15 +40,16 @@ model:
   cheat2d: { enabled: true, base: 64, depth: 8 }
   fusion: { out_ch: 128 }
   dec:    { mid_ch: 128, depth: 8 }
+  cheat_scale: 0.02
 
 train:
   seed: 1337
-  files_per_group: 100
-  epochs_per_group: 5
+  files_per_group: 50
+  epochs_per_group: 0
   epochs: 5
   batch_size: 5
-  lr: 5.0e-4
-  weight_decay: 1.0e-4
+  lr: 1.0e-5
+  weight_decay: 1.0e-5
   optimizer: "adamw"
   grad_accum_steps: 1
   amp: true
@@ -86,19 +58,22 @@ train:
   num_workers: 2
   ckpt_dir: "results"
   flush_every: 100
-  empty_cache_every: 200
+  empty_cache_every: 10
   grad_clip: 1.0
-  train_ratio: 0.9
+  train_ratio: 0.7
 
 losses:
   weights:
-    ssim:   0.40
-    psnr:   0.20
-    band:   0.10
-    energy: 0.10
-    ver:    0.10
-    ipdr:   0.10
-    tv:     0.00
+    l1:     0.2
+    L2:     0.2
+    ssim:   0.2   # structural similarity index weight
+    psnr:   0.1   # PSNR (converted to loss via psnr_ref) weight
+    band:   0.5
+    energy: 0.5
+    ver:    0.5
+    ipdr:   0.5
+    tv:     0.0
+    fp:     0.1
   band_low:  0.0
   band_high: 1.0
   ver_thr:   0.1

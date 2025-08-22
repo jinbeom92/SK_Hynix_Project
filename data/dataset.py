@@ -69,28 +69,45 @@ class ConcatDepthSliceDataset(Dataset):
     """
     Dataset for paired sinogram/voxel slices with depth concatenation.
 
-    Each dataset item corresponds to a single depth slice (z-plane),
-    sampled from a matched pair of sinogram [U, A, D] and voxel [X, Y, D].
+    Each dataset item corresponds to a single depth slice (z‑plane),
+    sampled from a matched pair of sinogram ``[U, A, D]`` and voxel
+    ``[X, Y, D]`` volumes.  The first dimension ``U`` is the number of
+    detector bins (channels), the second dimension ``A`` is the number of
+    projection angles, and the third dimension ``D`` is the number of depth
+    slices【488050982182324†L17-L23】.  By default, this dataset enforces that
+    all sinograms have the same ``(U, A)`` and all voxels have the same
+    ``(X, Y)``.  When sinograms with different detector counts are provided,
+    you may enable automatic upsampling by setting ``resample_u=True``.
 
     Args:
-        data_root (str): Root directory for dataset (default "data").
+        data_root (str): Root directory for dataset (default ``"data"``).
         sino_glob (str): Glob pattern for sinogram files under data_root.
         voxel_glob (str): Glob pattern for voxel files under data_root.
         sino_paths (Optional[List[str]]): Explicit list of sinogram paths (bypass glob).
         voxel_paths (Optional[List[str]]): Explicit list of voxel paths (bypass glob).
         report (bool): If True, prints dataset summary (default True).
+        resample_u (bool): If True, upsample sinograms along the detector
+            dimension to match the largest ``U`` in the dataset.  This can
+            resolve mismatched detector counts at the cost of introducing
+            interpolated detector samples.  The upsampling uses linear
+            interpolation and preserves the original projection angles and
+            depth.  Note that if the number of projection angles ``A``
+            differs across files, this dataset cannot automatically
+            reconcile them and will still raise an AssertionError.
 
     Workflow:
         - Loads all sinogram/voxel `.npy` files as memory maps.
-        - Validates that each pair has consistent (U,A) and (X,Y).
-        - Checks that sinogram depth D matches voxel depth D.
-        - Builds a global index mapping (file_idx, depth_idx).
-        - Each __getitem__ returns a dict with:
-            * "sino_ua":  [U,A] slice (torch.FloatTensor)
-            * "voxel_xy": [1,X,Y] slice (torch.FloatTensor, channel-first)
-            * "pair_index": index of the original file pair
-            * "local_z":   depth index within that file
-            * "global_z":  global depth index across dataset
+        - Optionally upsamples sinograms with smaller ``U`` to match the
+          largest ``U`` in the dataset when ``resample_u`` is enabled.
+        - Validates that each pair has consistent ``(U,A)`` and ``(X,Y)``.
+        - Checks that sinogram depth ``D`` matches voxel depth ``D``.
+        - Builds a global index mapping ``(file_idx, depth_idx)``.
+        - Each ``__getitem__`` returns a dict with:
+            * ``"sino_ua"``:  `[U,A]` slice (`torch.FloatTensor`)
+            * ``"voxel_xy"``: `[1,X,Y]` slice (`torch.FloatTensor`, channel‑first)
+            * ``"pair_index"``: index of the original file pair
+            * ``"local_z"``:   depth index within that file
+            * ``"global_z"``:  global depth index across dataset
     """
 
     def __init__(self,
@@ -99,7 +116,8 @@ class ConcatDepthSliceDataset(Dataset):
                  voxel_glob: str = "voxel/*_voxel.npy",
                  sino_paths: Optional[List[str]] = None,
                  voxel_paths: Optional[List[str]] = None,
-                 report: bool = True):
+                 report: bool = True,
+                 resample_u: bool = False):
         super().__init__()
         # ----------------------------------------------------------------------------------
         # File list selection
@@ -123,6 +141,43 @@ class ConcatDepthSliceDataset(Dataset):
         # ----------------------------------------------------------------------------------
         self.sinos  = [_load_sino_uaD(p) for p in self.sino_paths]    # each [U,A,D_i]
         self.voxels = [_load_voxel_xyD(p) for p in self.voxel_paths]  # each [X,Y,D_i]
+
+        # ----------------------------------------------------------------------------------
+        # Optionally resample sinograms along U dimension
+        # ----------------------------------------------------------------------------------
+        if resample_u:
+            # Determine the maximum detector count across all sinograms
+            U_max = max(s.shape[0] for s in self.sinos)
+            # All sinograms must share the same number of projection angles
+            A_first = self.sinos[0].shape[1]
+            # Resample any sinogram with U < U_max
+            new_sinos = []
+            for idx, s in enumerate(self.sinos):
+                U, A, D = s.shape
+                # Check that angles match; cannot resample angles automatically
+                if A != A_first:
+                    raise AssertionError(
+                        f"[sino] angle count mismatch at {self.sino_paths[idx]}: {A} vs {A_first}"
+                    )
+                if U != U_max:
+                    # Linear interpolation along detector axis to match U_max
+                    # We use numpy for interpolation; for each (A,D) slice we perform 1D interp
+                    x_orig = np.linspace(0.0, 1.0, U, dtype=np.float32)
+                    x_target = np.linspace(0.0, 1.0, U_max, dtype=np.float32)
+                    # Preallocate resampled array
+                    s_res = np.empty((U_max, A, D), dtype=s.dtype)
+                    for a in range(A):
+                        for d in range(D):
+                            vals = s[:, a, d]
+                            # Create interpolation function
+                            # Use numpy.interp for 1D linear interpolation
+                            s_res[:, a, d] = np.interp(x_target, x_orig, vals)
+                    new_sinos.append(s_res)
+                else:
+                    # If U already matches, keep as-is
+                    new_sinos.append(np.array(s, copy=False))
+            # Replace sinos list with resampled arrays
+            self.sinos = new_sinos
 
         # ----------------------------------------------------------------------------------
         # Validate shapes & build global index

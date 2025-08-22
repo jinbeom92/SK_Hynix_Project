@@ -6,6 +6,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 from torch.amp import GradScaler
 from torch import autocast
+import math
 
 from utils.yaml_config import load_config, save_effective_config
 from utils.seed import set_seed
@@ -13,6 +14,7 @@ from utils.logging import CSVLogger
 from data.dataset import ConcatDepthSliceDataset
 from models.hdn import HDNSystem
 from losses.recon import reconstruction_losses
+from losses.forward import forward_consistency_loss
 
 
 def _renorm(w: dict) -> dict:
@@ -236,6 +238,8 @@ def main(cfg_path: str):
 
     recon_w = _renorm(cfg["losses"]["weights"])
     tv_w = float(cfg["losses"].get("tv", 0.0))
+    # Forward projection loss weight (0.0 disables this term)
+    fp_weight = float(cfg["losses"]["weights"].get("fp", 0.0))
 
     # Exponential moving average for smoother display
     beta = 0.98
@@ -310,6 +314,9 @@ def main(cfg_path: str):
 
                     # IMPORTANT:
                     # If you want "higher PSNR → lower loss", use recon["psnr_loss"] instead of recon["psnr"].
+                    # ------------------------------------------------------------------
+                    # Composite image-space losses
+                    # ------------------------------------------------------------------
                     total = (
                         recon_w.get("ssim", 0)  * recon["ssim"]
                       + recon_w.get("psnr", 0)  * recon["psnr_loss"]
@@ -319,6 +326,39 @@ def main(cfg_path: str):
                       + recon_w.get("ipdr", 0)  * recon["ipdr"]
                       + recon_w.get("tv", 0)    * recon["tv"]
                     )
+
+                    # ------------------------------------------------------------------
+                    # Pixel-level loss terms (L1 and/or L2)
+                    # ------------------------------------------------------------------
+                    # We support two additional image-space losses:
+                    #  * L1: absolute difference between prediction and GT
+                    #  * L2: squared difference (MSE) between prediction and GT
+                    # The weights for these terms should be specified in
+                    # ``cfg['losses']['weights']`` as 'l1' and/or 'l2'.  They will
+                    # participate in the normalization performed by _renorm.
+                    l1_w = recon_w.get("l1", 0.0)
+                    l2_w = recon_w.get("l2", 0.0)
+                    if l1_w > 0.0:
+                        # Compute per-batch L1 loss on [B,1,1,X,Y] to match other terms
+                        l1_loss = (R_hat_n - V_gt_n).abs().mean(dim=[1, 2, 3, 4], keepdim=True)
+                        total = total + l1_w * l1_loss
+                    if l2_w > 0.0:
+                        # Compute per-batch L2 loss (MSE) on [B,1,1,X,Y]
+                        l2_loss = ((R_hat_n - V_gt_n) ** 2).mean(dim=[1, 2, 3, 4], keepdim=True)
+                        total = total + l2_w * l2_loss
+                    # Forward projection consistency loss
+                    if fp_weight > 0.0 and is_train:
+                        A = S_ua.shape[-1]  # number of projection angles
+                        angles = torch.linspace(
+                            0.0,
+                            math.pi,
+                            steps=A,
+                            dtype=R_hat.dtype,
+                            device=R_hat.device,
+                        )
+                        # R_hat and V_gt: [B,1,X,Y]
+                        fp_loss = forward_consistency_loss(R_hat, V_gt, angles)
+                        total = total + fp_weight * fp_loss
                     loss = total.mean() / accum_steps
 
                 # Backprop with optional AMP
