@@ -35,21 +35,27 @@ def _renorm(w: dict) -> dict:
 
 def evaluate_group_by_volume(model, ds, cfg, device):
     """
-    Volumetric evaluation across a whole file group (slice-by-slice inference).
+    Evaluate a trained model on a group of sinogram/voxel file pairs.
 
-    Strategy
-    --------
-    • For each file in the group:
-        1) Read its sinogram memmap [U, A, D_f] and voxel GT memmap [X, Y, D_f].
-        2) For d = 0..D_f-1, run the 2D slice recon (cheat OFF, eval mode).
-        3) Stack slices into a predicted volume [X, Y, D_f].
-        4) Convert both pred/gt to [1,1,D_f,X,Y] and compute losses.
-    • Average metrics over files in the group and return the summary dict.
+    This function iterates over each file pair in the given dataset and
+    performs **slice‑by‑slice inference** with cheat injection disabled
+    (i.e. ``train_mode=False``).  For a single file consisting of a
+    sinogram memmap ``[U, A, D_f]`` and voxel ground‑truth memmap
+    ``[X, Y, D_f]``, we loop over all depth slices ``d=0…D_f−1`` to
+    reconstruct each slice and assemble a predicted volume ``[X, Y, D_f]``.
+    We then reshape both the predicted and ground‑truth volumes to
+    ``[1, 1, D_f, X, Y]`` and compute the same composite losses used during
+    training (SSIM, PSNR, band, energy, ver, ipdr, TV).  Metrics are
+    averaged across all files in the group and returned as a summary
+    dictionary.
 
     Notes
     -----
-    • `model(..., train_mode=False)` disables cheat injection by design.
-    • Uses the same loss set as training for consistency (but aggregated at volume level).
+    * Cheat injection is disabled in evaluation mode to avoid leaking
+      ground‑truth information into the reconstruction【470627143552496†L75-L99】.  The
+      predicted slice is obtained solely from the sinogram input.
+    * The volumetric losses use the same weights as training, ensuring
+      consistency between slice‑level and volume‑level evaluations.
     """
     model.eval()
     recon_w = _renorm(cfg["losses"]["weights"])
@@ -105,20 +111,61 @@ def evaluate_group_by_volume(model, ds, cfg, device):
 
 def main(cfg_path: str):
     """
-    Train loop over grouped depth-slices with periodic volumetric evaluation.
+    Run the training loop over grouped depth‑slices with periodic volumetric evaluation.
 
-    Pipeline
-    --------
-    1) Load YAML config and persist an "effective" copy (same content;
-       file is named .json by convention but contains YAML).
-    2) Fix random seeds; choose device.
-    3) Enumerate sinogram/voxel files and split into groups of size N.
-    4) For each group:
-         • Build `ConcatDepthSliceDataset` (concatenate along depth axis).
-         • Train for `epochs_per_group` epochs over its slice DataLoader.
-         • Log per-step metrics to CSV (EMA running average).
-         • At epoch end, do volumetric eval (slice-by-slice inference).
-         • Track and save the best checkpoint by (1 − SSIM) on volume metrics.
+    This script implements the **HDN/SVTR** training procedure for tomographic
+    reconstruction.  It operates on pairs of sinograms and voxel volumes
+    loaded by :class:`ConcatDepthSliceDataset`.  Each sinogram has shape
+    ``[U, A, D]`` where ``U`` is the number of detector bins, ``A`` the number of
+    projection angles and ``D`` the number of depth slices, and each voxel
+    volume has shape ``[X, Y, D]``【470627143552496†L17-L23】.  The dataset returns one
+    depth slice at a time: a sinogram slice ``[U, A]``, a voxel slice
+    ``[1, X, Y]`` and bookkeeping indices for the file pair and depth
+    【470627143552496†L75-L99】.
+
+    The goal of training is to predict high‑quality reconstructions of the
+    voxel slice from its corresponding sinogram slice.  We clamp the
+    reconstructions to the interval ``[0, 1]`` to mimic the non‑negativity
+    constraints of filtered backprojection; conventional ramp‑filtered FBP
+    introduces negative intensities that must be clipped【508774924062640†L39-L44】.  We
+    use a composite loss consisting of SSIM, PSNR, band, energy, ver, ipdr and
+    total variation, following the HDN paper.  Unlike previous variants of
+    this project, **we do not use VAMToolbox optimized reconstructions as
+    supervision**; instead, the ground‑truth voxel slices are the sole
+    targets.  This simplifies the training loop to its original form and
+    focuses on learning a good mapping from sinogram domain to image domain.
+
+    For reference, the optional forward‑projection consistency term would
+    compare the forward projection of the reconstructed slice with the
+    input sinogram using a differentiable projector.  ASTRA Toolbox
+    implements a CPU forward projection algorithm that “takes a projector and
+    a volume as input, and returns the projection data”【941924045700879†L38-L40】.
+    We omit this term in the current training loop, but the commented
+    structure makes it easy to reintroduce a differentiable projector when
+    needed.
+
+    Pipeline overview:
+
+    1. **Load YAML configuration** and save an “effective” copy for
+    reproducibility.
+    2. **Seed random number generators** and select CUDA or CPU device.
+    3. **Enumerate sinogram/voxel files** under ``data_root`` and split into
+    groups of at most ``files_per_group`` pairs.
+    4. For each group:
+    a. **Construct a dataset** by concatenating all depth slices of
+        sinogram/voxel pairs and wrap it in a DataLoader.
+    b. **Train** for ``epochs_per_group`` epochs over the DataLoader.
+    c. **Log** per‑step losses (EMA running average) to a CSV file.
+    d. At the end of each epoch, perform **volumetric evaluation** by
+        reconstructing entire volumes slice‑by‑slice (cheat OFF) and
+        computing the same losses.  The best checkpoint is selected
+        based on the volumetric SSIM.
+
+    This file, like the rest of the project, uses English docstrings with
+    citations to external references.  Please consult the VAMToolbox
+    repository for details on its optimized reconstructions, the HDN paper
+    for architectural design choices, and ASTRA Toolbox documentation for
+    forward projection implementations.
     """
     # --- Config IO ------------------------------------------------------------
     cfg = load_config(cfg_path)

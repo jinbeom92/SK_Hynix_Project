@@ -60,12 +60,25 @@ class DecoderSlice2D(nn.Module):
 
     def forward(self, F_xy):
         """
-        Forward pass.
+        Decode fused features into a reconstructed slice and clamp to [0, 1].
+
+        This decoder processes the aligned and fused feature map ``F_xy``
+        through a series of convolutional blocks and a final 1×1
+        projection.  The raw output may contain negative values or
+        exceed unity because convolutional filters can introduce
+        oscillations and overshoot, analogous to the negative intensities
+        observed in ramp‑filtered backprojection【508774924062640†L39-L44】.  To
+        enforce a physically meaningful intensity range, we clamp the
+        reconstruction to the interval ``[0, 1]`` before returning it.
 
         Args:
-            F_xy (Tensor): [B, in_ch, X, Y] feature map
+            F_xy (Tensor): `[B, in_ch, X, Y]` fused feature map from the encoder,
+                alignment and fusion stages.
 
         Returns:
-            Tensor: [B, 1, X, Y] decoded voxel slice
+            Tensor: `[B, 1, X, Y]` reconstructed voxel slice with values in
+            ``[0, 1]``.
         """
-        return self.net(F_xy)
+        out = self.net(F_xy)
+        # Clamp in-place: negative values → 0, values >1 → 1.
+        return out.clamp_(min=0.0, max=1.0)

@@ -73,7 +73,7 @@ model:
 train:
   seed: 1337
   files_per_group: 100
-  epochs_per_group: 1
+  epochs_per_group: 5
   epochs: 5
   batch_size: 5
   lr: 5.0e-4
