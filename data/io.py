@@ -5,26 +5,33 @@ import numpy as np
 # I/O utilities for numpy arrays (sinograms and voxel volumes)
 # ==========================================================================================
 
-def load_npy(path: str):
+def load_npy(path: str) -> np.ndarray:
     """
-    Load a NumPy `.npy` file.
+    Load a NumPy ``.npy`` file into memory as-is.
 
-    Args:
-        path (str): Path to `.npy` file.
+    Parameters
+    ----------
+    path : str
+        Path to the ``.npy`` file.
 
-    Returns:
-        np.ndarray: Loaded array in memory.
+    Returns
+    -------
+    np.ndarray
+        Loaded array in memory (no permutation, no dtype casting).
     """
     return np.load(path)
 
 
-def save_npy(path: str, arr):
+def save_npy(path: str, arr) -> None:
     """
-    Save an array to `.npy` format, ensuring that parent directories exist.
+    Save an array to ``.npy`` format, ensuring that parent directories exist.
 
-    Args:
-        path (str): Output file path.
-        arr  (array-like): Array to save.
+    Parameters
+    ----------
+    path : str
+        Output file path.
+    arr : array-like
+        Array to save.
     """
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)  # recursively create dirs if needed
@@ -32,62 +39,88 @@ def save_npy(path: str, arr):
 
 
 # ==========================================================================================
-# Shape validation / normalization helpers
+# Shape validation / normalization helpers (strictly (X,A,Z) and (X,Y,Z))
 # ==========================================================================================
 
 def ensure_sino_shape(arr: np.ndarray) -> np.ndarray:
     """
-    Ensure sinogram has a canonical shape.
+    Ensure a sinogram has the canonical model shape **[X, A, Z]** = (x, a, z).
 
-    Supported input shapes:
-      - [A, U]        : Angles × Detector bins (single slice).
-      - [A, V, U]     : Angles × Views × Detector bins.
+    Supported input shapes
+    ----------------------
+    - ``[X, A]``         : single-z sinogram → upgraded to ``[X, A, 1]``.
+    - ``[X, A, Z]``      : full volume → returned as-is.
 
-    Normalization:
-      - If input is [A, U], a singleton 'view' axis (V=1) is inserted,
-        yielding [A, 1, U].
-      - If input is [A, V, U], it is returned as-is.
+    Notes
+    -----
+    - **No axis permutation** is performed. This function only validates
+      and, if needed, inserts a singleton Z-axis at the end.
+    - If your data is stored with any other axis order (e.g., ``[A, X]`` or
+      ``[Z, X, A]``), convert it **before** calling this function.
 
-    Args:
-        arr (np.ndarray): Input sinogram array.
+    Parameters
+    ----------
+    arr : np.ndarray
+        Input sinogram array.
 
-    Returns:
-        np.ndarray: Sinogram with shape [A, V, U].
+    Returns
+    -------
+    np.ndarray
+        Sinogram with shape ``[X, A, Z]``.
+
+    Raises
+    ------
+    ValueError
+        If the input does not match ``[X,A]`` or ``[X,A,Z]``.
     """
-    if arr.ndim == 2:  # upgrade to [A,1,U]
-        A, U = arr.shape
-        arr = arr.reshape(A, 1, U)
+    if arr.ndim == 2:  # upgrade to [X,A,1]
+        X, A = arr.shape
+        arr = arr.reshape(X, A, 1)
     elif arr.ndim == 3:
+        # Expect [X, A, Z]; do not permute
         pass
     else:
-        raise ValueError("sino must be [A,U] or [A,V,U]")
+        raise ValueError("sinogram must be shaped [X,A] or [X,A,Z] (x,a,(z)).")
     return arr
 
 
 def ensure_voxel_shape(arr: np.ndarray) -> np.ndarray:
     """
-    Ensure voxel volume has a canonical shape.
+    Ensure a voxel volume has the canonical model shape **[X, Y, Z]** = (x, y, z).
 
-    Supported input shapes:
-      - [H, W]        : Single 2D slice (Height × Width).
-      - [D, H, W]     : Depth × Height × Width (3D volume).
+    Supported input shapes
+    ----------------------
+    - ``[X, Y]``         : single-z slice → upgraded to ``[X, Y, 1]``.
+    - ``[X, Y, Z]``      : full volume → returned as-is.
 
-    Normalization:
-      - If input is [H, W], a singleton depth axis (D=1) is inserted,
-        yielding [1, H, W].
-      - If input is [D, H, W], it is returned as-is.
+    Notes
+    -----
+    - **No axis permutation** is performed. This function only validates
+      and, if needed, inserts a singleton Z-axis at the end.
+    - If your data is stored with any other axis order (e.g., ``[Y, X]`` or
+      ``[Z, X, Y]``), convert it **before** calling this function.
 
-    Args:
-        arr (np.ndarray): Input voxel array.
+    Parameters
+    ----------
+    arr : np.ndarray
+        Input voxel array.
 
-    Returns:
-        np.ndarray: Voxel volume with shape [D, H, W].
+    Returns
+    -------
+    np.ndarray
+        Voxel volume with shape ``[X, Y, Z]``.
+
+    Raises
+    ------
+    ValueError
+        If the input does not match ``[X,Y]`` or ``[X,Y,Z]``.
     """
-    if arr.ndim == 2:  # upgrade to [1,H,W]
-        H, W = arr.shape
-        arr = arr.reshape(1, H, W)
+    if arr.ndim == 2:  # upgrade to [X,Y,1]
+        X, Y = arr.shape
+        arr = arr.reshape(X, Y, 1)
     elif arr.ndim == 3:
+        # Expect [X, Y, Z]; do not permute
         pass
     else:
-        raise ValueError("voxel must be [H,W] or [D,H,W]")
+        raise ValueError("voxel must be shaped [X,Y] or [X,Y,Z] (x,y,(z)).")
     return arr

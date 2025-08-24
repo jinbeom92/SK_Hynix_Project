@@ -34,18 +34,17 @@ data:
   resample_u: false
 
 model:
-  enc1:   { base: 64, depth: 8 }
-  enc2:   { base: 64, depth: 8 }
-  align:  { out_ch: 96, depth: 8, interp_mode: bilinear }
+  enc1:    { base: 64, depth: 8 }
+  enc2:    { base: 64, depth: 8 }
+  align:   { out_ch: 96, depth: 8, interp_mode: bilinear }
   cheat2d: { enabled: true, base: 64, depth: 8 }
-  fusion: { out_ch: 128 }
-  dec:    { mid_ch: 128, depth: 8 }
-  cheat_scale: 0.02
+  fusion:  { out_ch: 128 }
+  sino_dec: { mid_ch: 128, depth: 8, interp_mode: bilinear }
 
 train:
   seed: 1337
   files_per_group: 50
-  epochs_per_group: 0
+  epochs_per_group: 50
   epochs: 5
   batch_size: 5
   lr: 1.0e-5
@@ -65,15 +64,15 @@ train:
 losses:
   weights:
     l1:     0.2
-    L2:     0.2
-    ssim:   0.2   # structural similarity index weight
-    psnr:   0.1   # PSNR (converted to loss via psnr_ref) weight
-    band:   0.5
-    energy: 0.5
-    ver:    0.5
-    ipdr:   0.5
+    l2:     0.0
+    ssim:   0.4
+    psnr:   0.2
+    band:   0.05
+    energy: 0.05
+    ver:    0.05
+    ipdr:   0.05
     tv:     0.0
-    fp:     0.1
+    fp:     0.0
   band_low:  0.0
   band_high: 1.0
   ver_thr:   0.1

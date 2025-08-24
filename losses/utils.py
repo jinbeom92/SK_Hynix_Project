@@ -8,32 +8,33 @@ def per_sample_sino_scale(
     """
     Compute a per-sample robust scale for sinograms via high-quantile norm.
 
-    Purpose
-    -------
-    Normalizes each sample by a robust magnitude estimate so that downstream losses
-    operate in a comparable range across batches. Uses the q-quantile of |S_in|.
+    Axis convention
+    ---------------
+    Sinogram is in **(x, a, z)** order → tensor shape **[B, X, A, Z]**.
 
-    Shapes
-    ------
-    S_in : [B, A, V, U]   (any dtype; typically float32/float16)
-    return: [B, 1, 1, 1]  (broadcastable per-sample scale; requires_grad=False)
-
-    Args
-    ----
-    q   : float
-          Quantile in (0,1). Recommended 0.95~0.995. Higher → less sensitive to outliers.
+    Parameters
+    ----------
+    S_in : Tensor
+        Input sinograms with shape **[B, X, A, Z]** (any floating dtype).
+    q : float
+        Quantile in (0,1). Typical 0.95–0.995. Higher → less sensitive to outliers.
     eps : float
-          Lower clamp to avoid division by zero.
+        Lower clamp to avoid division by zero.
+
+    Returns
+    -------
+    Tensor
+        Per-sample scale with shape **[B, 1, 1, 1]** (broadcastable).
+        `requires_grad=False`.
 
     Notes
     -----
-    • `torch.no_grad()` ensures the scale is not part of the gradient graph.
-    • Use this with broadcast division: x / s where s has shape [B,1,1,1].
+    • Uses the q-quantile of |S_in| per sample.
+    • Wraps computation in `torch.no_grad()` to keep it out of the graph.
     """
     with torch.no_grad():
         B = S_in.shape[0]
-        # Flatten per sample, take quantile of absolute values
-        s = torch.quantile(S_in.abs().reshape(B, -1), q, dim=1)
+        s = torch.quantile(S_in.abs().reshape(B, -1), q, dim=1)  # [B]
         s = s.clamp_min(eps).view(B, 1, 1, 1)  # [B,1,1,1]
     return s  # requires_grad=False
 
@@ -48,33 +49,52 @@ def normalize_tensors(
     """
     Normalize sinograms and volumes using per-sample sinogram scales.
 
-    Purpose
-    -------
-    Ensures both detector-domain tensors (S_in, sino_hat) and volume-domain tensors
-    (R_hat, V_gt) are put on a consistent normalized scale per sample.
+    Axis convention
+    ---------------
+    - Sinograms: **(x, a, z)** → **[B, X, A, Z]**
+    - Volumes:   **(x, y, z)** → **[B, X, Y, Z]** or **[B, 1, X, Y, Z]**
 
-    Shapes
-    ------
-    S_in, sino_hat : [B, A, V, U]
-    R_hat, V_gt    : [B, 1, D, H, W]
-    s_sino         : [B, 1, 1, 1]  (output from per_sample_sino_scale)
-    returns        : (S_in_n, sino_hat_n, R_hat_n, V_gt_n)
-                     with same shapes as inputs
+    Parameters
+    ----------
+    S_in, sino_hat : Tensor
+        Shapes **[B, X, A, Z]**.
+    R_hat, V_gt : Tensor
+        Shapes **[B, X, Y, Z]** or **[B, 1, X, Y, Z]**.
+    s_sino : Tensor
+        Per-sample scale **[B, 1, 1, 1]** returned by `per_sample_sino_scale`.
+
+    Returns
+    -------
+    Tuple[Tensor, Tensor, Tensor, Tensor]
+        `(S_in_n, sino_hat_n, R_hat_n, V_gt_n)` with the **same shapes**
+        as their respective inputs.
 
     Notes
     -----
-    • Volume scaling uses the same per-sample scale as sinograms by broadcasting
-      to [B,1,1,1,1], which ties both domains to the same intensity reference.
-    • Assumes input arrays are non-negative or loosely in [0, +], but will work
-      with signed data as well (scale uses |S_in| quantile).
+    • The same per-sample scale is broadcast to both detector domain
+      (sinograms) and volume domain, tying intensities to a common reference.
+    • No axis permutation, no dtype changes — only broadcast division.
     """
-    # Detector-domain normalization
-    S_in_n     = S_in     / s_sino                 # [B,A,V,U]
-    sino_hat_n = sino_hat / s_sino                 # [B,A,V,U]
+    # Detector-domain normalization (x,a,z): [B,X,A,Z] / [B,1,1,1]
+    S_in_n     = S_in     / s_sino
+    sino_hat_n = sino_hat / s_sino
 
-    # Volume-domain normalization (broadcast the same per-sample scale)
-    s_vol   = s_sino.view(-1, 1, 1, 1, 1)          # [B,1,1,1,1]
-    R_hat_n = R_hat / s_vol                        # [B,1,D,H,W]
-    V_gt_n  = V_gt  / s_vol                        # [B,1,D,H,W]
+    # Volume-domain normalization (x,y,z)
+    if R_hat.ndim == 5:   # [B,1,X,Y,Z]
+        s_vol_R = s_sino.view(-1, 1, 1, 1, 1)
+    elif R_hat.ndim == 4: # [B,X,Y,Z]
+        s_vol_R = s_sino
+    else:
+        raise ValueError(f"R_hat must be [B,X,Y,Z] or [B,1,X,Y,Z], got {tuple(R_hat.shape)}")
+
+    if V_gt.ndim == 5:    # [B,1,X,Y,Z]
+        s_vol_V = s_sino.view(-1, 1, 1, 1, 1)
+    elif V_gt.ndim == 4:  # [B,X,Y,Z]
+        s_vol_V = s_sino
+    else:
+        raise ValueError(f"V_gt must be [B,X,Y,Z] or [B,1,X,Y,Z], got {tuple(V_gt.shape)}")
+
+    R_hat_n = R_hat / s_vol_R
+    V_gt_n  = V_gt  / s_vol_V
 
     return S_in_n, sino_hat_n, R_hat_n, V_gt_n

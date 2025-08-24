@@ -1,4 +1,3 @@
-import math
 import torch
 import torch.nn.functional as F
 
@@ -7,97 +6,142 @@ __all__ = [
     "forward_consistency_loss",
 ]
 
+def _to_b1xyz(img: torch.Tensor) -> torch.Tensor:
+    """
+    Canonicalize input to [B, 1, X, Y, Z] without permuting axes.
+
+    Accepted shapes
+    ---------------
+    - [B, X, Y, Z]      → unsqueeze channel → [B, 1, X, Y, Z]
+    - [B, 1, X, Y, Z]   → returned as-is
+    - [B, 1, X, Y]      → add Z=1          → [B, 1, X, Y, 1]
+
+    Raises
+    ------
+    ValueError if shape doesn't match any of the above.
+    """
+    if img.dim() == 5:
+        B, C, X, Y, Z = img.shape
+        if C != 1:
+            raise ValueError(f"img with shape {tuple(img.shape)} has C={C} ≠ 1.")
+        return img
+    elif img.dim() == 4:
+        # Ambiguity: could be [B,1,X,Y] or [B,X,Y,Z].
+        if img.shape[1] == 1:
+            # [B,1,X,Y] → [B,1,X,Y,1]
+            return img.unsqueeze(-1)
+        else:
+            # [B,X,Y,Z] → [B,1,X,Y,Z]
+            return img.unsqueeze(1)
+    else:
+        raise ValueError(
+            "img must be [B,X,Y,Z], [B,1,X,Y,Z], or [B,1,X,Y]. "
+            f"Got {tuple(img.shape)}"
+        )
+
+
 def radon_forward_slice(img: torch.Tensor, angles: torch.Tensor) -> torch.Tensor:
     """
-    Compute a parallel-beam Radon transform (forward projection) of a batch
-    of 2D images using rotation and integration.  This function maps a
-    reconstructed slice into a sinogram by rotating it through the given
-    angles and summing pixel values along one axis, matching the physics
-    of parallel-beam CT.【470627143552496†L17-L23】
+    Parallel-beam Radon transform of an entire **(x,y,z)** volume into a
+    **(x,a,z)** sinogram, computed slice-by-slice along z.
 
     Parameters
     ----------
     img : Tensor
-        Reconstructed slices with shape ``[B, C, X, Y]``, where ``C`` is the
-        channel dimension (typically 1), ``X`` and ``Y`` are the spatial
-        dimensions (height and width).
+        Reconstructed volume with shape **[B, X, Y, Z]**, **[B, 1, X, Y, Z]**,
+        or a single 2D slice **[B, 1, X, Y]** (treated as Z=1).
+        The second dimension is interpreted as channel and must be 1 when present.
     angles : Tensor
-        1D tensor of length ``A`` containing projection angles in radians.
+        1D tensor of length **A** with projection angles (radians).
 
     Returns
     -------
     Tensor
-        A sinogram tensor of shape ``[B, C, X, A]``.  The first spatial
-        dimension ``X`` corresponds to detector bins (U) and the last
-        dimension ``A`` corresponds to projection angles.
+        Sinogram with shape **[B, X, A, Z]** where:
+        - X: detector bins (integration is along **Y**),
+        - A: number of angles,
+        - Z: depth (slice index).
 
     Notes
     -----
-    * The transform is differentiable with respect to ``img``.  It uses
-      ``torch.nn.functional.grid_sample`` to implement rotation and then
-      integrates along the width axis to simulate detector integration.
-    * The rotation is performed about the center of the image.  Pixels
-      outside the field of view are implicitly zero.
+    * Rotation uses `torch.nn.functional.grid_sample` with bilinear sampling
+      and zero padding, centered on the image.
+    * Integration is the discrete sum along the **Y** axis to produce **X**
+      detector bins, so the result matches the (x, a, z) convention.
+    * Differentiable w.r.t. `img`.
     """
-    B, C, X, Y = img.shape
-    device = img.device
-    dtype = img.dtype
-    A = angles.numel()
-    # Prepare output tensor
-    sino = torch.zeros((B, C, X, A), device=device, dtype=dtype)
-    # Construct base grid for one image (normalized coordinates)
-    base_grid = None
-    # For each angle, rotate the image and integrate along width
-    for i, theta in enumerate(angles):
-        c = torch.cos(theta).to(device=device, dtype=dtype)
-        s = torch.sin(theta).to(device=device, dtype=dtype)
-        # Affine matrix for rotation (no translation)
-        rot = torch.tensor([[c, -s, 0.0], [s, c, 0.0]], device=device, dtype=dtype)
-        rot = rot.unsqueeze(0).repeat(B, 1, 1)  # [B, 2, 3]
-        # Compute grid only once for the current angle and batch
-        grid = F.affine_grid(rot, size=img.shape, align_corners=False)
-        # Sample the rotated image
-        rotated = F.grid_sample(img, grid, mode="bilinear", padding_mode="zeros", align_corners=False)
-        # Integrate along width (axis=3) to form detector bin values
-        # rotated shape: [B, C, X, Y]; integrate along Y → [B, C, X]
-        proj = rotated.sum(dim=3)
-        sino[:, :, :, i] = proj
+    # Canonicalize to [B,1,X,Y,Z]
+    img = _to_b1xyz(img)
+    device, dtype = img.device, img.dtype
+    B, _, X, Y, Z = img.shape
+
+    # Angles
+    angles = angles.to(device=device, dtype=dtype)
+    A = int(angles.numel())
+
+    # Prepare output [B, X, A, Z]
+    sino = img.new_zeros((B, X, A, Z))
+
+    # Flatten (B, Z) into a single batch so we rotate all slices at once per angle.
+    # img_bz: [B*Z, 1, X, Y]
+    img_bz = img.permute(0, 4, 1, 2, 3).contiguous().view(B * Z, 1, X, Y)
+
+    # Process each angle; per-angle grid (shared across all B*Z slices)
+    for i in range(A):
+        theta = angles[i]
+        c = torch.cos(theta)
+        s = torch.sin(theta)
+
+        # Build [B*Z, 2, 3] rotation matrices on the correct device/dtype
+        rot = img_bz.new_zeros((B * Z, 2, 3))
+        rot[:, 0, 0] = c
+        rot[:, 0, 1] = -s
+        rot[:, 1, 0] = s
+        rot[:, 1, 1] = c
+
+        # Grid and rotate all (B*Z) slices together
+        grid = F.affine_grid(rot, size=(B * Z, 1, X, Y), align_corners=False)
+        rotated = F.grid_sample(
+            img_bz, grid, mode="bilinear", padding_mode="zeros", align_corners=False
+        )  # [B*Z,1,X,Y]
+
+        # Integrate along Y → detector bins X
+        proj = rotated.sum(dim=3)  # [B*Z,1,X]
+
+        # Reshape back to [B,X,Z] and place into angle slot i
+        proj_bxz = proj.view(B, Z, 1, X).permute(0, 3, 2, 1).squeeze(2)  # [B,X,Z]
+        sino[:, :, i, :] = proj_bxz
+
     return sino
 
 
-def forward_consistency_loss(pred_slice: torch.Tensor,
-                             gt_slice: torch.Tensor,
-                             angles: torch.Tensor) -> torch.Tensor:
+def forward_consistency_loss(
+    pred_slice: torch.Tensor,
+    gt_slice: torch.Tensor,
+    angles: torch.Tensor,
+) -> torch.Tensor:
     """
-    Compute a forward-projection consistency loss between predicted and
-    ground‑truth slices.  This loss encourages the network's predicted
-    reconstruction to produce the same sinogram as the ground‑truth when
-    projected with a parallel-beam Radon transform.
+    Forward-projection consistency loss on **(x,y,z)** volumes.
 
-    Given a predicted slice ``pred_slice`` and a ground‑truth slice
-    ``gt_slice`` (both shaped ``[B, 1, X, Y]``), this function
-    computes their sinograms using ``radon_forward_slice`` and then
-    returns the mean squared error (MSE) between the two sinograms.
+    Given predicted and ground-truth recon volumes (any of
+    ``[B,X,Y,Z]``, ``[B,1,X,Y,Z]`` or 2D slices ``[B,1,X,Y]``),
+    compute their sinograms with ``radon_forward_slice`` and return the
+    mean squared error over **[B, X, A, Z]**.
 
     Parameters
     ----------
     pred_slice : Tensor
-        Predicted reconstructed slice with shape ``[B, 1, X, Y]``.
+        Predicted volume/slice, accepts ``[B,X,Y,Z]``, ``[B,1,X,Y,Z]`` or ``[B,1,X,Y]``.
     gt_slice : Tensor
-        Ground‑truth reconstructed slice with shape ``[B, 1, X, Y]``.
+        Ground-truth volume/slice, accepts the same shapes as `pred_slice`.
     angles : Tensor
-        1D tensor of projection angles in radians.  Its length defines
-        the number of projections ``A``.
+        1D tensor of projection angles in radians (length **A**).
 
     Returns
     -------
     Tensor
-        Scalar tensor representing the MSE between the sinograms of the
-        predicted and ground‑truth slices.  The result is differentiable
-        with respect to the inputs and can be used directly as a loss.
+        Scalar MSE loss between the two sinograms.
     """
-    # Compute forward projections (sinograms) of predicted and ground‑truth slices
-    sino_pred = radon_forward_slice(pred_slice, angles)  # [B,1,X,A]
-    sino_gt = radon_forward_slice(gt_slice, angles)      # [B,1,X,A]
-    # Mean squared error over all elements
+    sino_pred = radon_forward_slice(pred_slice, angles)  # [B, X, A, Z]
+    sino_gt   = radon_forward_slice(gt_slice, angles)    # [B, X, A, Z]
     return F.mse_loss(sino_pred, sino_gt)
