@@ -148,7 +148,7 @@ def main(cfg_path: str):
 
     csv_logger = CSVLogger(
         str(Path("results") / "train_log.csv"),
-        fieldnames=["group", "epoch", "step", "loss_total", "running_avg", "mse"],
+        fieldnames=["group", "epoch", "step", "running_avg", "loss_total", "mse",],
     )  # :contentReference[oaicite:15]{index=15}
 
     # --- Loss: ExpandMaskedMSE (soft boundary) ---------------------------------------------
@@ -284,10 +284,19 @@ def main(cfg_path: str):
                     step_loss = float((loss_tensor.mean()).item())
                     ema = step_loss if ema is None else (beta * ema + (1.0 - beta) * step_loss)
                     running_avg = ema / (1.0 - beta ** steps)
+                    
+                mse_val = float(step_loss.detach().item())
+                val_total = mse_val
 
                 csv_logger.log(
-                    {"group": g_idx + 1, "epoch": epoch, "step": steps,
-                     "loss": step_loss, "running_avg": running_avg, "vol_loss": vol_loss, "mse": ExpandMaskedMSE},
+                    {
+                        "group": g_idx + 1,
+                        "epoch": epoch,
+                        "step": steps,
+                        "loss_total": val_total,
+                        "mse": mse_val,
+                        "running_avg": running_avg,
+                    },
                     flush=(steps % flush_every == 0),
                 )
                 pbar.set_postfix({"avg": f"{running_avg:.4f}", "loss": f"{step_loss:.4f}"}, refresh=False)
@@ -303,20 +312,8 @@ def main(cfg_path: str):
             with torch.no_grad():
                 vol_loss = evaluate_group_by_volume_mse(model, ds, device, criterion)
 
-            mse_val = float(step_loss.detach().item())
-            val_total = mse_val
-            
-            csv_logger.log(
-                {
-                    "group": g_idx + 1,
-                    "epoch": epoch,
-                    "step": steps,
-                    "loss_total": val_total,
-                    "mse": mse_val,
-                    "running_avg": running_avg,
-                },
-                flush=(steps % flush_every == 0),
-            )
+            csv_logger.log({"group": g_idx + 1, "epoch": epoch, "step": steps,
+                            "loss": "", "running_avg": "", "vol_loss": vol_loss}, flush=True)
 
             # Best checkpoint by lowest vol_loss
             if vol_loss < best_val:
