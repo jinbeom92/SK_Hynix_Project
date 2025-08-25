@@ -72,59 +72,48 @@ class JosephProjector3D(BaseProjector3D):
     """
     Joseph 3D projector (voxel-driven / sampled ray integration).
 
-    Method
-    ------
-    • Integrates along rays parameterized by detector coordinates (u, v) and angle θ.
-    • Samples the volume on regular parametric steps with trilinear interpolation
-      via ``torch.nn.functional.grid_sample``.
-    • Accumulates along the ray and scales by the step length ``delta_t``.
-
-    Notes
-    -----
-    • Angle/channel/step chunking controls memory.
-    • Internally uses ``align_corners=True`` because index normalization maps
-      voxel centers to ``[-1, 1]``.
+    Backprojection override
+    -----------------------
+    The `backproject()` method is replaced with a faithful PyTorch port of
+    scikit-image's `iradon` (filtered backprojection) applied slice-wise
+    along z. Input sinogram slices are [X, A] with rows=X detector bins
+    and columns=A angles; the 2D FBP returns [Y, Y] which we transpose
+    to [X, Y] to match the model-facing layout (x, y).
     """
 
     def __init__(self, geom: Parallel3DGeometry, n_steps: Optional[int] = None):
         super().__init__(geom)
-        # Cache angles and trig
+        # Angle/trig caches (still used by forward)
         self.register_buffer("angles", geom.angles.clone().detach())
         self.register_buffer("cos_angles", torch.cos(self.angles))
         self.register_buffer("sin_angles", torch.sin(self.angles))
 
-        # # of integration steps per ray
+        # Joseph forward parameters (unchanged)
         self.n_steps = int(n_steps if n_steps is not None else geom.n_steps_cap)
-
-        # Detector physical coordinates centered at 0 (v: vertical=z, u: horizontal=x)
         V, U = geom.V, geom.U
         sv, su = geom.det_spacing
         v = (torch.arange(V, dtype=torch.float32) - (V - 1) / 2.0) * sv
         u = (torch.arange(U, dtype=torch.float32) - (U - 1) / 2.0) * su
         self.register_buffer("u_phys", u)
         self.register_buffer("v_phys", v)
-
-        # Voxel spacing & integration step
         sd, sy, sx = geom.voxel_size
         D, H, W = geom.D, geom.H, geom.W
         self.sx = float(sx); self.sy = float(sy); self.sd = float(sd)
-
-        # Half diagonal radius in XY plane
         T = 0.5 * float(((W - 1) * sx) ** 2 + ((H - 1) * sy) ** 2) ** 0.5
         self.T = float(T)
         self.delta_t = (2.0 * self.T) / float(self.n_steps)
-
-        # Runtime chunking knobs
         self.step_chunk = max(1, min(8, self.n_steps))
         self.c_chunk = 4
 
+        # FBP options (externally adjustable)
+        self.ir_filter_name: Optional[str] = "ramp"   # {'ramp','shepp-logan','cosine','hamming','hann',None}
+        self.ir_interpolation: str = "linear"         # {'linear','nearest'}
+        self.ir_circle: bool = True                   # circular support mask
+
     @torch.no_grad()
     def reset_geometry(self, geom: Parallel3DGeometry):
-        """
-        Update cached geometry-dependent buffers (angles, trig caches, detector coords).
-        """
+        """Update geometry-dependent buffers (same as before)."""
         self.geom = geom
-
         new_angles = geom.angles.detach().to(self.angles.device, dtype=self.angles.dtype)
         self.angles.resize_(new_angles.shape).copy_(new_angles)
         self.cos_angles.resize_(new_angles.shape).copy_(torch.cos(new_angles))
@@ -147,19 +136,22 @@ class JosephProjector3D(BaseProjector3D):
         self.delta_t = (2.0 * self.T) / float(self.n_steps)
         self.step_chunk = max(1, min(self.step_chunk, self.n_steps))
 
+    # ----------------------------
+    # Joseph forward (unchanged)
+    # ----------------------------
     def forward(self, vol: torch.Tensor) -> torch.Tensor:
         """
-        Volume → Sinogram (Joseph forward), **model-facing I/O**.
+        Volume → Sinogram (Joseph forward), model-facing I/O.
 
         Parameters
         ----------
         vol : Tensor
-            **[B, C, X, Y, Z]** volume (x,y,z).
+            [B, C, X, Y, Z] volume (x,y,z).
 
         Returns
         -------
         Tensor
-            **[B, C, X, A, Z]** sinogram (x,a,z).
+            [B, C, X, A, Z] sinogram (x,a,z).
         """
         # Convert model layout [B,C,X,Y,Z] → internal [B,C,D,H,W]
         vol = vol.permute(0, 1, 4, 3, 2).contiguous()
@@ -169,63 +161,48 @@ class JosephProjector3D(BaseProjector3D):
         device = vol.device
 
         def _safe_norm(idx: torch.Tensor, size: int) -> torch.Tensor:
-            """Map voxel indices (0..size-1) to grid_sample range [-1, 1]."""
             if size <= 1:
                 return torch.zeros_like(idx)
             return (2.0 * idx) / (size - 1) - 1.0
 
-        # Output buffer in internal layout [B,C,A,V,U]
         sino_full = torch.empty((B, C, A, V, U), device=device, dtype=vol.dtype)
 
-        # Angle chunking
         for a0 in range(0, A, self.geom.angle_chunk):
             a1 = min(a0 + self.geom.angle_chunk, A)
+            cos_t = self.cos_angles[a0:a1].view(-1, 1, 1, 1)
+            sin_t = self.sin_angles[a0:a1].view(-1, 1, 1, 1)
+            u_phys = self.u_phys.view(1, 1, 1, U)
+            v_phys = self.v_phys.view(1, 1, V, 1)
+            x0 = -u_phys * sin_t
+            y0 =  u_phys * cos_t
+            z0 =  v_phys.expand(cos_t.shape[0], 1, V, 1)
 
-            cos_t = self.cos_angles[a0:a1].view(-1, 1, 1, 1)  # [Aa,1,1,1]
-            sin_t = self.sin_angles[a0:a1].view(-1, 1, 1, 1)  # [Aa,1,1,1]
-
-            u_phys = self.u_phys.view(1, 1, 1, U)             # [1,1,1,U]
-            v_phys = self.v_phys.view(1, 1, V, 1)             # [1,1,V,1]
-
-            # Ray bases at t = 0
-            x0 = -u_phys * sin_t                               # [Aa,1,1,U]
-            y0 =  u_phys * cos_t                               # [Aa,1,1,U]
-            z0 =  v_phys.expand(cos_t.shape[0], 1, V, 1)       # [Aa,1,V,1]
-
-            # Accumulator for this chunk
             sino_accum = torch.zeros(B, C, cos_t.shape[0], V, U, device=device, dtype=vol.dtype)
 
-            # Tile volume across angles into batch dimension: [B*Aa,C,D,H,W]
             if B == 1:
                 v_base = vol.expand(cos_t.shape[0], C, D, H, W)
             else:
                 v_base = vol.repeat_interleave(cos_t.shape[0], dim=0)
 
-            # Channel chunking
             for c0 in range(0, C, max(1, self.c_chunk)):
                 c1 = min(c0 + max(1, self.c_chunk), C)
                 v_in = v_base[:, c0:c1].contiguous()
                 accum_c = torch.zeros(B, c1 - c0, cos_t.shape[0], V, U, device=device, dtype=vol.dtype)
 
-                # Step chunking along t
                 for s0 in range(0, self.n_steps, self.step_chunk):
                     s1 = min(s0 + self.step_chunk, self.n_steps)
-
                     i = torch.arange(s0, s1, device=device, dtype=vol.dtype).view(1, -1, 1, 1)
-                    t = (-self.T + (i + 0.5) * self.delta_t)  # [1,S,1,1]
+                    t = (-self.T + (i + 0.5) * self.delta_t)
 
-                    # Ray points in physical coords
-                    x = (x0 + t * cos_t).expand(-1, -1, V, -1)      # [Aa,S,V,U]
-                    y = (y0 + t * sin_t).expand(-1, -1, V, -1)      # [Aa,S,V,U]
-                    z = (z0 + torch.zeros_like(t)).expand(-1, -1, -1, U)  # [Aa,S,V,U]
+                    x = (x0 + t * cos_t).expand(-1, -1, V, -1)
+                    y = (y0 + t * sin_t).expand(-1, -1, V, -1)
+                    z = (z0 + torch.zeros_like(t)).expand(-1, -1, -1, U)
 
-                    # → voxel indices → normalized for grid_sample
                     x_idx = x / self.sx + (W - 1) / 2.0
                     y_idx = y / self.sy + (H - 1) / 2.0
                     z_idx = z / self.sd + (D - 1) / 2.0
                     x_n = _safe_norm(x_idx, W); y_n = _safe_norm(y_idx, H); z_n = _safe_norm(z_idx, D)
 
-                    # 5D grid for grid_sample: [N, D_out=S, H_out=V, W_out=U, 3]
                     grid = torch.stack([x_n, y_n, z_n], dim=-1)  # [Aa,S,V,U,3]
                     grid = grid.unsqueeze(0).expand(B, -1, -1, -1, -1, -1).reshape(
                         B * cos_t.shape[0], s1 - s0, V, U, 3
@@ -233,114 +210,226 @@ class JosephProjector3D(BaseProjector3D):
                     if grid.dtype != v_in.dtype:
                         grid = grid.to(v_in.dtype)
 
-                    # Trilinear sampling over volume
                     samples = F.grid_sample(v_in, grid, mode="bilinear",
-                                            padding_mode="zeros", align_corners=True)  # [N,Cc,S,V,U]
-
-                    # Sum over steps, restore [B,Cc,Aa,V,U]
+                                            padding_mode="zeros", align_corners=True)
                     part = samples.sum(dim=2).view(B, cos_t.shape[0], c1 - c0, V, U).permute(0, 2, 1, 3, 4)
                     accum_c.add_(part)
 
-                    # Clean up big temporaries
                     del i, t, x, y, z, x_idx, y_idx, z_idx, x_n, y_n, z_n, grid, samples, part
 
                 sino_accum[:, c0:c1].add_(accum_c)
                 del v_in, accum_c
 
-            # Scale accumulated sum by delta_t
             sino = sino_accum.mul(self.delta_t).contiguous()
             sino_full[:, :, a0:a1, :, :] = sino
             del sino_accum, sino, v_base
 
-        # Convert internal [B,C,A,V,U] → model [B,C,X,A,Z] with (U→X, V→Z)
-        sino_xaz = sino_full.permute(0, 1, 4, 2, 3).contiguous()
-        return sino_xaz
+        return sino_full.permute(0, 1, 4, 2, 3).contiguous()  # [B,C,X,A,Z]
 
+    # ----------------------------
+    # FBP (scikit-image iradon) BP
+    # ----------------------------
+    @staticmethod
+    def _next_pow2(n: int) -> int:
+        """Return max(64, next power-of-two >= 2*n)."""
+        return max(64, 1 << ((2 * n - 1).bit_length()))
+
+    @staticmethod
+    def _sinogram_circle_to_square_torch(sino: torch.Tensor) -> torch.Tensor:
+        """Pad rows so that the circle-inscribed width becomes square (skimage)."""
+        import math
+        N, A = sino.shape
+        diagonal = int(math.ceil(math.sqrt(2.0) * N))
+        pad = diagonal - N
+        old_center = N // 2
+        new_center = diagonal // 2
+        pad_before = new_center - old_center
+        # pad = (right_left_for_last_dim, ..., left_right_for_first_dim)
+        return F.pad(sino, (0, 0, pad_before, pad - pad_before), mode="constant", value=0.0)
+
+    @staticmethod
+    def _get_fourier_filter_torch(size: int, filter_name: Optional[str], device, dtype) -> torch.Tensor:
+        """Fourier filters identical to scikit-image's _get_fourier_filter."""
+        import math
+        n1 = torch.arange(1, size // 2 + 1, 2, device=device)
+        n2 = torch.arange(size // 2 - 1, 0, -2, device=device)
+        n = torch.cat([n1, n2]).to(torch.float32)
+
+        f = torch.zeros(size, device=device, dtype=torch.float32)
+        f[0] = 0.25
+        f[1::2] = -(1.0 / (math.pi * n) ** 2)
+
+        fourier_filter = 2.0 * torch.real(torch.fft.fft(f))  # ramp
+
+        if filter_name == "ramp":
+            pass
+        elif filter_name == "shepp-logan":
+            omega = math.pi * torch.fft.fftfreq(size, d=1.0, device=device)[1:]
+            ff = fourier_filter.clone()
+            ff[1:] = ff[1:] * (torch.sin(omega) / omega).to(ff.dtype)
+            fourier_filter = ff
+        elif filter_name == "cosine":
+            freq = torch.linspace(0.0, math.pi, steps=size, device=device, dtype=torch.float32)
+            fourier_filter = fourier_filter * torch.fft.fftshift(torch.sin(freq))
+        elif filter_name == "hamming":
+            w = torch.hamming_window(size, periodic=False, device=device, dtype=torch.float32)
+            fourier_filter = fourier_filter * torch.fft.fftshift(w)
+        elif filter_name == "hann":
+            w = torch.hann_window(size, periodic=False, device=device, dtype=torch.float32)
+            fourier_filter = fourier_filter * torch.fft.fftshift(w)
+        elif filter_name is None:
+            fourier_filter = torch.ones_like(fourier_filter)
+
+        return fourier_filter.to(dtype=dtype).view(size, 1)
+
+    @staticmethod
+    def _interp1d_linear_torch(col: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        """1D linear interpolation with zero outside, x = arange(N) - N//2."""
+        N = col.shape[0]
+        center = N // 2
+        idx = t + center
+        i0 = torch.floor(idx).to(torch.long).clamp(0, N - 1)
+        i1 = (i0 + 1).clamp(0, N - 1)
+        w = (idx - i0.to(idx.dtype)).clamp(0, 1)
+        y0 = col[i0]; y1 = col[i1]
+        out = (1.0 - w) * y0 + w * y1
+        mask = (idx < 0) | (idx > (N - 1))
+        return torch.where(mask, torch.zeros((), device=out.device, dtype=out.dtype), out)
+
+    @staticmethod
+    def _interp1d_nearest_torch(col: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        """1D nearest interpolation with zero outside, x = arange(N) - N//2."""
+        N = col.shape[0]
+        center = N // 2
+        idx = torch.round(t + center).to(torch.long)
+        mask = (idx < 0) | (idx >= N)
+        idx = idx.clamp(0, N - 1)
+        out = col[idx]
+        return torch.where(mask, torch.zeros((), device=out.device, dtype=out.dtype), out)
+
+    @staticmethod
+    def _iradon_torch_2d(
+        radon_image: torch.Tensor,         # [N, A]
+        theta_deg: torch.Tensor,           # [A]
+        output_size: int,
+        filter_name: Optional[str] = "ramp",
+        interpolation: str = "linear",
+        circle: bool = True,
+    ) -> torch.Tensor:
+        """2D FBP identical to scikit-image's `iradon`, implemented in torch."""
+        if radon_image.ndim != 2:
+            raise ValueError("radon_image must be [N, A].")
+        if theta_deg.ndim != 1 or theta_deg.numel() != radon_image.shape[1]:
+            raise ValueError("theta length must match number of projection columns.")
+
+        device, dtype = radon_image.device, radon_image.dtype
+        N, A = radon_image.shape
+
+        sino = radon_image
+        if circle:
+            sino = JosephProjector3D._sinogram_circle_to_square_torch(sino)
+            N = sino.shape[0]
+
+        proj_size_padded = JosephProjector3D._next_pow2(N)
+        sino_pad = F.pad(sino, (0, 0, 0, proj_size_padded - N), mode="constant", value=0.0)
+
+        Ffilt = JosephProjector3D._get_fourier_filter_torch(proj_size_padded, filter_name, device=device, dtype=sino_pad.dtype)
+        proj_fft = torch.fft.fft(sino_pad, dim=0) * Ffilt
+        radon_filtered = torch.real(torch.fft.ifft(proj_fft, dim=0))[:N, :]  # [N, A]
+
+        recon = torch.zeros((output_size, output_size), device=device, dtype=dtype)
+        radius = output_size // 2
+        yy, xx = torch.meshgrid(
+            torch.arange(output_size, device=device, dtype=dtype),
+            torch.arange(output_size, device=device, dtype=dtype),
+            indexing="ij",
+        )
+        ypr = yy - radius
+        xpr = xx - radius
+
+        theta_rad = torch.deg2rad(theta_deg.to(dtype))
+        cos_t, sin_t = torch.cos(theta_rad), torch.sin(theta_rad)
+
+        if interpolation not in ("linear", "nearest"):
+            raise ValueError("interpolation must be 'linear' or 'nearest'.")
+
+        for i in range(A):
+            col = radon_filtered[:, i]  # [N]
+            t = ypr * cos_t[i] - xpr * sin_t[i]
+            if interpolation == "linear":
+                recon += JosephProjector3D._interp1d_linear_torch(col, t)
+            else:
+                recon += JosephProjector3D._interp1d_nearest_torch(col, t)
+
+        if circle:
+            # Mask out pixels lying outside the inscribed circular support of the reconstruction grid.
+            mask = (xpr**2 + ypr**2) > (radius**2)
+            recon = torch.where(mask, torch.zeros((), dtype=dtype, device=device), recon)
+
+        # Scale: pi / (2 * A)  (scikit-image normalization)
+        import math
+        recon = recon * (math.pi / (2.0 * A))
+        return recon
+
+    @torch.no_grad()
     def backproject(self, sino: torch.Tensor) -> torch.Tensor:
         """
-        Sinogram → Volume (Joseph backprojection), **model-facing I/O**.
+        Sinogram → Volume via scikit-image `iradon` (slice-wise FBP).
 
         Parameters
         ----------
         sino : Tensor
-            **[B, C, X, A, Z]** sinogram (x,a,z).
+            [B, C, X, A, Z] sinogram (x,a,z).
 
         Returns
         -------
         Tensor
-            **[B, C, X, Y, Z]** backprojected volume (x,y,z).
+            [B, C, X, Y, Z] backprojected volume (x,y,z).
         """
-        # Convert model layout [B,C,X,A,Z] → internal [B,C,A,V,U]
-        sino = sino.permute(0, 1, 3, 4, 2).contiguous()
-        B, C, A, V, U = sino.shape
-        D, H, W = self.geom.D, self.geom.H, self.geom.W
+        if sino.ndim != 5:
+            raise ValueError(f"Expected [B,C,X,A,Z], got {tuple(sino.shape)}")
+        B, C, X, A, Z = sino.shape
+        Y = self.geom.H
         device = sino.device
+        dtype = sino.dtype
 
-        su = float(self.geom.det_spacing[1])
-        sv = float(self.geom.det_spacing[0])
+        # Degrees for skimage-equivalent API
+        import math
+        theta_deg = (self.geom.angles * (180.0 / math.pi)).to(torch.float32).to(device)
 
-        def _safe_norm(idx: torch.Tensor, size: int) -> torch.Tensor:
-            """Map indices to [-1, 1] for grid_sample."""
-            if size <= 1:
-                return torch.zeros_like(idx)
-            return (2.0 * idx) / (size - 1) - 1.0
+        out = torch.zeros((B, C, X, Y, Z), device=device, dtype=dtype)
 
-        # Physical coordinates of voxel centers
-        z_phys = (torch.arange(D, device=device, dtype=torch.float32) - (D - 1) / 2.0) * self.sd
-        y_phys = (torch.arange(H, device=device, dtype=torch.float32) - (H - 1) / 2.0) * self.sy
-        x_phys = (torch.arange(W, device=device, dtype=torch.float32) - (W - 1) / 2.0) * self.sx
+        for b in range(B):
+            for c in range(C):
+                s_bc = sino[b, c]  # [X, A, Z]
+                for z in range(Z):
+                    s_2d = s_bc[:, :, z].to(dtype)  # [X, A]
+                    rec_y_y = JosephProjector3D._iradon_torch_2d(
+                        s_2d,
+                        theta_deg,
+                        output_size=Y,
+                        filter_name=self.ir_filter_name,
+                        interpolation=self.ir_interpolation,
+                        circle=self.ir_circle,
+                    )  # [Y, Y]
+                    # Transpose to [X, Y] for model-facing (x,y)
+                    out[b, c, :, :, z] = rec_y_y.t()
 
-        # XY meshgrid (indexing="xy" → X with W-axis, Y with H-axis)
-        Xg, Yg = torch.meshgrid(x_phys, y_phys, indexing="xy")
+        # --- Circular masking in XY for the final 3D volume (optional) ---
+        # Applies an inscribed disk mask on each (X,Y) slice uniformly across Z.
+        # This complements the per-slice mask inside `_iradon_torch_2d` and guarantees
+        # consistent circular support after the [Y,Y]→[X,Y] transpose.
+        if self.ir_circle:
+            xx = torch.arange(X, device=device, dtype=torch.float32) - (X - 1) / 2.0
+            yy = torch.arange(Y, device=device, dtype=torch.float32) - (Y - 1) / 2.0
+            Xg, Yg = torch.meshgrid(xx, yy, indexing="ij")  # [X,Y]
+            r = min((X - 1) / 2.0, (Y - 1) / 2.0)
+            circ = ((Xg**2 + Yg**2) <= (r**2)).to(dtype)  # [X,Y]
+            out.mul_(circ.view(1, 1, X, Y, 1))  # broadcast across [B,C,Z]
 
-        # Output accumulator in internal layout [B,C,D,H,W]
-        vol = torch.zeros((B, C, D, H, W), device=device, dtype=sino.dtype)
-
-        for a0 in range(0, A, self.geom.angle_chunk):
-            a1 = min(a0 + self.geom.angle_chunk, A)
-            cos_t = self.cos_angles[a0:a1].view(-1, 1, 1)
-            sin_t = self.sin_angles[a0:a1].view(-1, 1, 1)
-
-            # Map (X,Y) plane to detector u for each angle
-            # U_phys = -X*sinθ + Y*cosθ
-            U_phys_map = (-Xg.T.unsqueeze(0) * sin_t + Yg.T.unsqueeze(0) * cos_t)
-            u_idx = U_phys_map / su + (U - 1) / 2.0
-            u_norm = _safe_norm(u_idx, U)
-
-            # Reorder sinogram for grid_sample: [Aa*B, C, V, U]
-            x_in_all = sino[:, :, a0:a1, :, :].permute(0, 2, 1, 3, 4).reshape(B * cos_t.shape[0], C, V, U)
-
-            # Iterate over Z (internal D)
-            for k in range(D):
-                v_idx = z_phys[k] / sv + (V - 1) / 2.0
-                v_norm = _safe_norm(v_idx, V)  # scalar
-
-                # Build grid for 2D sampling over (U,V): [N, H, W, 2]
-                grid = torch.stack([u_norm, torch.full_like(u_norm, v_norm)], dim=-1)
-                grid = grid.unsqueeze(0).repeat(B, 1, 1, 1, 1).view(B * cos_t.shape[0], H, W, 2)
-
-                # Channel chunking
-                for c0 in range(0, C, max(1, self.c_chunk)):
-                    c1 = min(c0 + max(1, self.c_chunk), C)
-                    x_in = x_in_all[:, c0:c1].contiguous()
-                    grid_cast = grid.to(x_in.dtype) if grid.dtype != x_in.dtype else grid
-
-                    samp = F.grid_sample(x_in, grid_cast, mode="bilinear",
-                                         padding_mode="zeros", align_corners=True)
-                    samp = samp.view(B, cos_t.shape[0], c1 - c0, H, W).sum(dim=1)
-                    vol[:, c0:c1, k, :, :].add_(samp)
-                    del x_in, samp
-
-                del grid
-
-            del x_in_all
-
-        # Scale by step length
-        vol = vol * self.delta_t
-
-        # Convert internal [B,C,D,H,W] → model [B,C,X,Y,Z] (W→X, H→Y, D→Z)
-        vol_xyz = vol.permute(0, 1, 4, 3, 2).contiguous()
+        vol_xyz = out
         return vol_xyz
+
 
 
 class SiddonProjector3D(BaseProjector3D):

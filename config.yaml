@@ -37,14 +37,14 @@ model:
   enc1:    { base: 64, depth: 8 }
   enc2:    { base: 64, depth: 8 }
   align:   { out_ch: 96, depth: 8, interp_mode: bilinear }
-  cheat2d: { enabled: true, base: 64, depth: 8 }
+  cheat2d: { enabled: false, base: 64, depth: 8 }
   fusion:  { out_ch: 128 }
   sino_dec: { mid_ch: 128, depth: 8, interp_mode: bilinear }
 
 train:
   seed: 1337
-  files_per_group: 50
-  epochs_per_group: 50
+  files_per_group: 10
+  epochs_per_group: 1
   epochs: 5
   batch_size: 5
   lr: 1.0e-5
@@ -63,14 +63,14 @@ train:
 
 losses:
   weights:
-    l1:     0.2
+    l1:     0.1
     l2:     0.0
-    ssim:   0.4
-    psnr:   0.2
-    band:   0.05
-    energy: 0.05
-    ver:    0.05
-    ipdr:   0.05
+    ssim:   0.1
+    psnr:   0.1
+    band:   0.2
+    energy: 0.2
+    ver:    0.3
+    ipdr:   0.0
     tv:     0.0
     fp:     0.0
   band_low:  0.0
