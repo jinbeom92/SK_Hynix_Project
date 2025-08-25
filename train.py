@@ -1,10 +1,11 @@
+# train.py
 """
 Train HDN with **masked MSE only** and **unfiltered backprojection**.
 
 Pipeline (slice training with Z=1)
 ----------------------------------
 Sino(x,a,z) → Enc1(A) + Enc2(XA) → Sino2XYAlign(XA→XY) → (optional) VoxelCheat2D →
-Fusion2D(XY) → SinoDecoder2D(XY→XA) → **JosephProjector3D.backproject (unfiltered)** →
+Fusion2D(XY) → SinoDecoder2D(XY→XA) → JosephProjector3D.backproject (unfiltered) →
 Recon(x,y,z) → ExpandMaskedMSE(pred=Recon2D, soft-boundary mask/targets from GT2D)
 
 Axis convention (model-facing, fixed)
@@ -12,19 +13,11 @@ Axis convention (model-facing, fixed)
 • Sinogram : (x, a, z) → [B, 1, X, A, Z]
 • Volume   : (x, y, z) → [B, 1, X, Y, Z]
 
-Key components (repo refs)
---------------------------
-• Config I/O / reproducibility / CSV logging: utils.yaml_config, utils.seed, utils.logging. 
-• Dataset (paired depth slices): data.dataset.ConcatDepthSliceDataset. :contentReference[oaicite:1]{index=1}
-• Geometry + projector factory (Joseph 3D BP): physics.geometry, physics.projector. 
-• HDN model (encoders/align/fusion/decoder + projector BP): models.hdn.HDNSystem. :contentReference[oaicite:3]{index=3}
-
 Notes
 -----
-• BP filter is **forced OFF** at runtime (`model.projector.ir_filter_name = None`) so the
-  backprojection is **unfiltered** (pure BP). :contentReference[oaicite:4]{index=4}
-• Loss is **ExpandMaskedMSE** only (in-part + near-boundary out-of-part soft labels),
-  averaged over the masked pixels per 2D slice.
+• Backprojection is **unfiltered by implementation** in `physics/projector.py`.
+• Training loss is **ExpandMaskedMSE** only (in-part + near-boundary out-of-part
+  with soft labels in [boundary_low, boundary_high]), averaged over the masked pixels.
 """
 
 from pathlib import Path
@@ -38,29 +31,48 @@ from tqdm import tqdm
 from torch.amp import GradScaler
 from torch import autocast
 
-from utils.yaml_config import load_config, save_effective_config           # :contentReference[oaicite:5]{index=5}
-from utils.seed import set_seed                                            # :contentReference[oaicite:6]{index=6}
-from utils.logging import CSVLogger                                        # :contentReference[oaicite:7]{index=7}
-from data.dataset import ConcatDepthSliceDataset                           # :contentReference[oaicite:8]{index=8}
-from models.hdn import HDNSystem                                           # :contentReference[oaicite:9]{index=9}
-from physics.geometry import Parallel3DGeometry                            # :contentReference[oaicite:10]{index=10}
-from physics.projector import make_projector                               # :contentReference[oaicite:11]{index=11}
-
+from utils.yaml_config import load_config, save_effective_config
+from utils.seed import set_seed
+from utils.logging import CSVLogger
+from data.dataset import ConcatDepthSliceDataset
+from models.hdn import HDNSystem
+from physics.geometry import Parallel3DGeometry
+from physics.projector import make_projector
 from losses.expand_mask_mse import ExpandMaskedMSE
 
 
 def _as_float(x):
+    """
+    Convert a scalar (Python number or 0-d torch.Tensor) to float safely.
+
+    Parameters
+    ----------
+    x : Union[float, int, torch.Tensor]
+
+    Returns
+    -------
+    float
+    """
     return float(x) if not torch.is_tensor(x) else float(x.detach().item())
+
 
 def _init_amp(device: torch.device, cfg: dict):
     """
-    Decide AMP dtype and scaler.
+    Decide AMP dtype and scaler based on config and hardware.
+
+    Parameters
+    ----------
+    device : torch.device
+    cfg : dict
 
     Returns
     -------
     enabled : bool
+        Whether autocast/GradScaler should be enabled.
     amp_dtype : torch.dtype
-    scaler : GradScaler
+        Preferred compute dtype for autocast.
+    scaler : torch.amp.GradScaler
+        Gradient scaler (no-op if disabled).
     """
     want = (cfg["train"].get("amp_dtype", "auto") or "auto").lower()
     if want == "bf16":
@@ -75,24 +87,26 @@ def _init_amp(device: torch.device, cfg: dict):
 
 
 @torch.no_grad()
-def evaluate_group_by_volume_mse(model: torch.nn.Module,
-                                 ds: ConcatDepthSliceDataset,
-                                 device: torch.device,
-                                 criterion: torch.nn.Module) -> float:
+def evaluate_group_by_volume_mse(
+    model: torch.nn.Module,
+    ds: ConcatDepthSliceDataset,
+    device: torch.device,
+    criterion: torch.nn.Module,
+) -> float:
     """
-    Volumetric evaluation by masked MSE only (slice-wise → per-volume mean → mean over files).
+    Volumetric evaluation by **masked MSE only** (slice-wise → per-volume mean → mean over files).
 
-    For each file pair:
-      • For every depth d, run slice inference with Z=1 (cheat OFF).
-      • Compute `criterion(recon2d, gt2d)` per slice, average over depth.
-    Returns the mean over files.
+    For each file pair in the dataset:
+      • Iterate depth d = 0..D-1 and run slice inference with Z=1 (cheat OFF).
+      • Compute `criterion(recon2d, gt2d)` per slice and average over depth.
+    Returns the mean masked MSE across files.
     """
     model.eval()
     loss_sum = 0.0
     file_cnt = 0
 
     for s_mem, v_mem in zip(ds.sinos, ds.voxels):
-        D = v_mem.shape[-1]
+        D = int(v_mem.shape[-1])
         z_sum = 0.0
 
         for d in range(D):
@@ -102,8 +116,8 @@ def evaluate_group_by_volume_mse(model: torch.nn.Module,
             S = torch.from_numpy(s_ua).to(device).unsqueeze(0).unsqueeze(1).unsqueeze(-1)  # [1,1,X,A,1]
             V = torch.from_numpy(v_xy).to(device).unsqueeze(0).unsqueeze(0)                # [1,1,X,Y]
 
-            _, recon = model(S, v_vol=None, train_mode=False)   # [1,1,X,A,1], [1,1,X,Y,1]
-            R2 = recon[..., 0]                                   # [1,1,X,Y]
+            _, recon = model(S, v_vol=None, train_mode=False)  # [1,1,X,A,1], [1,1,X,Y,1]
+            R2 = recon[..., 0]                                 # [1,1,X,Y]
 
             z_sum += float(criterion(R2, V).item())
 
@@ -124,11 +138,11 @@ def main(cfg_path: str):
     • Recon out   : [B,1,X,Y,1]
     """
     # --- Config / device / seed ------------------------------------------------------------
-    cfg = load_config(cfg_path)                                                  # :contentReference[oaicite:12]{index=12}
-    save_effective_config(cfg, Path(cfg_path).with_name("effective_config.json"))# :contentReference[oaicite:13]{index=13}
+    cfg = load_config(cfg_path)
+    save_effective_config(cfg, Path(cfg_path).with_name("effective_config.json"))
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    set_seed(int(cfg["train"]["seed"]))                                          # :contentReference[oaicite:14]{index=14}
+    set_seed(int(cfg["train"]["seed"]))
     amp_enabled, amp_dtype, scaler = _init_amp(device, cfg)
 
     # --- Discover files & group them -------------------------------------------------------
@@ -137,22 +151,25 @@ def main(cfg_path: str):
     voxel_glob = cfg.get("data", {}).get("voxel_glob", "voxel/*_voxel.npy")
 
     all_sino = sorted(Path(data_root).glob(sino_glob))
-    all_vox  = sorted(Path(data_root).glob(voxel_glob))
+    all_vox = sorted(Path(data_root).glob(voxel_glob))
     if len(all_sino) != len(all_vox):
         raise AssertionError(f"#sino({len(all_sino)}) != #voxel({len(all_vox)})")
 
     files_per_group = int(cfg["train"].get("files_per_group", 100))
-    groups = [(all_sino[i:i + files_per_group], all_vox[i:i + files_per_group])
-              for i in range(0, len(all_sino), files_per_group)]
+    groups = [
+        (all_sino[i : i + files_per_group], all_vox[i : i + files_per_group])
+        for i in range(0, len(all_sino), files_per_group)
+    ]
 
     # --- Logging ---------------------------------------------------------------------------
     Path("results").mkdir(parents=True, exist_ok=True)
-    ckpt_dir = Path(cfg["train"]["ckpt_dir"]); ckpt_dir.mkdir(parents=True, exist_ok=True)
+    ckpt_dir = Path(cfg["train"]["ckpt_dir"])
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
 
     csv_logger = CSVLogger(
         str(Path("results") / "train_log.csv"),
-        fieldnames=["group", "epoch", "step", "running_avg", "loss_total", "mse",],
-    )  # :contentReference[oaicite:15]{index=15}
+        fieldnames=["group", "epoch", "step", "running_avg", "loss_total", "mse", "vol_loss"],
+    )
 
     # --- Loss: ExpandMaskedMSE (soft boundary) ---------------------------------------------
     lcfg = cfg.get("losses", {})
@@ -166,9 +183,10 @@ def main(cfg_path: str):
         clamp_pred_gt=bool(lcfg.get("expand_clamp", True)),
     ).to(device)
 
-    # --- Optimizer -------------------------------------------------------------------------
+    # --- Optimizer & misc hyperparams ------------------------------------------------------
     name = str(cfg["train"].get("optimizer", "adamw")).lower()
-    lr = float(cfg["train"]["lr"]); wd = float(cfg["train"]["weight_decay"])
+    lr = float(cfg["train"]["lr"])
+    wd = float(cfg["train"]["weight_decay"])
 
     grad_clip = float(cfg["train"]["grad_clip"])
     accum_steps = max(1, int(cfg["train"].get("grad_accum_steps", 1)))
@@ -193,7 +211,7 @@ def main(cfg_path: str):
             sino_paths=[str(p) for p in sino_paths],
             voxel_paths=[str(p) for p in voxel_paths],
             report=True,
-        )  # :contentReference[oaicite:16]{index=16}
+        )
         dl = DataLoader(
             ds,
             batch_size=int(cfg["train"]["batch_size"]),
@@ -203,7 +221,9 @@ def main(cfg_path: str):
         )
 
         # Geometry & projector (Z=1 for slice training)
-        U, A = ds.U, ds.A; X, Y = ds.X, ds.Y; Z = 1
+        U, A = ds.U, ds.A
+        X, Y = ds.X, ds.Y
+        Z = 1
         angles = torch.linspace(0.0, math.pi, steps=A, device=device, dtype=torch.float32)
 
         geom = Parallel3DGeometry.from_xyz(
@@ -214,12 +234,11 @@ def main(cfg_path: str):
             det_spacing_xz=tuple(map(float, cfg.get("geom", {}).get("det_spacing_xz", (1.0, 1.0)))),
             angle_chunk=int(cfg.get("geom", {}).get("angle_chunk", 16)),
             n_steps_cap=int(cfg.get("geom", {}).get("n_steps_cap", 256)),
-        )  # :contentReference[oaicite:17]{index=17}
+        )
 
         if model is None:
             projector = make_projector(str(cfg.get("projector", {}).get("method", "joseph3d")).lower(), geom).to(device)
             model = HDNSystem(cfg, projector=projector).to(device)
-
 
             if bool(cfg["train"].get("compile", False)) and hasattr(torch, "compile"):
                 model = torch.compile(model)
@@ -249,20 +268,21 @@ def main(cfg_path: str):
                 steps += 1
 
                 # Batch tensors
-                S_ua = batch["sino_ua"].to(device, non_blocking=True)   # [B,U,A]
+                S_ua = batch["sino_ua"].to(device, non_blocking=True)   # [B,U,A] ≡ [B,X,A]
                 V_gt = batch["voxel_xy"].to(device, non_blocking=True)  # [B,1,X,Y]
 
                 # Canonicalize to model I/O
                 S_xaz = S_ua.unsqueeze(1).unsqueeze(-1)  # [B,1,X,A,1]
                 V_xyz = V_gt.unsqueeze(-1)               # [B,1,X,Y,1]
 
+                # Depth index to gate cheat path
                 z = int(batch["global_z"][0]) if hasattr(batch["global_z"], "__len__") else int(batch["global_z"])
                 is_train_slice = (z in train_set)
 
                 with autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
                     sino_hat, recon = model(S_xaz, v_vol=(V_xyz if is_train_slice else None), train_mode=is_train_slice)
-                    R2 = recon[..., 0]  # [B,1,X,Y]
-                    loss_tensor = criterion(R2, V_gt)    # scalar masked MSE on 2D slice
+                    R2 = recon[..., 0]                  # [B,1,X,Y]
+                    loss_tensor = criterion(R2, V_gt)   # masked MSE (2D slice)
                     loss = loss_tensor.mean() / accum_steps
 
                 # Backprop + update (AMP-aware)
@@ -277,28 +297,29 @@ def main(cfg_path: str):
                     torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
 
                     if scaler.is_enabled():
-                        scaler.step(opt); scaler.update()
+                        scaler.step(opt)
+                        scaler.update()
                     else:
                         opt.step()
                     opt.zero_grad(set_to_none=True)
 
-                # Running EMA + logging
+                # Running EMA + step logging
                 with torch.no_grad():
                     step_loss = float((loss_tensor.mean()).item())
                     ema = step_loss if ema is None else (beta * ema + (1.0 - beta) * step_loss)
                     running_avg = ema / (1.0 - beta ** steps)
-                    
-                mse_val = _as_float(step_loss)
-                val_total = mse_val
+
+                mse_val = _as_float(step_loss)  # numeric only for logging
+                val_total = mse_val             # only MSE is used
 
                 csv_logger.log(
                     {
                         "group": g_idx + 1,
                         "epoch": epoch,
                         "step": steps,
+                        "running_avg": running_avg,
                         "loss_total": val_total,
                         "mse": mse_val,
-                        "running_avg": running_avg,
                     },
                     flush=(steps % flush_every == 0),
                 )
@@ -312,24 +333,34 @@ def main(cfg_path: str):
                         torch.cuda.empty_cache()
 
             # Volumetric eval (masked MSE only; cheat OFF)
-            with torch.no_grad():
-                vol_loss = evaluate_group_by_volume_mse(model, ds, device, criterion)
+            vol_loss = float(evaluate_group_by_volume_mse(model, ds, device, criterion))
 
-            csv_logger.log({"group": g_idx + 1, "epoch": epoch, "step": steps,
-                            "loss": "", "running_avg": "", "vol_loss": vol_loss}, flush=True)
-
-            # Best checkpoint by lowest vol_loss
-            if vol_loss < best_val:
-                best_val = vol_loss
-                state = {
+            csv_logger.log(
+                {
                     "group": g_idx + 1,
                     "epoch": epoch,
-                    "model_state": {k: v.detach().cpu() for k, v in model.state_dict().items()},
-                    "opt_state": opt.state_dict(),
-                    "scaler_state": scaler.state_dict(),
-                    "config": cfg,
-                }
-                torch.save(state, str(ckpt_dir / "best_shared.pt"))
+                    "step": steps,
+                    "running_avg": "",
+                    "loss_total": "",
+                    "mse": "",
+                    "vol_loss": vol_loss,
+                },
+                flush=True,
+            )
+
+            # Best checkpoint by lowest vol_loss
+            if not (vol_loss != vol_loss):  # NaN guard
+                if vol_loss < best_val:
+                    best_val = vol_loss
+                    state = {
+                        "group": g_idx + 1,
+                        "epoch": epoch,
+                        "model_state": {k: v.detach().cpu() for k, v in model.state_dict().items()},
+                        "opt_state": opt.state_dict(),
+                        "scaler_state": scaler.state_dict(),
+                        "config": cfg,
+                    }
+                    torch.save(state, str(ckpt_dir / "best_shared.pt"))
 
     csv_logger.close()
 

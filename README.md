@@ -1,181 +1,256 @@
-# SVTR — Sinogram-to-Volume Tomographic Reconstruction
+# SVTR: Sinogram-to-Volume Tomographic Reconstruction
 
-This repository provides a **PyTorch-based framework** for high-dimensional neural (HDN-inspired) tomographic reconstruction.  
-The system eliminates traditional FBP from the training path and directly optimizes sinograms to produce physically consistent 3D reconstructions.
+## Overview
 
----
+**SVTR** is a PyTorch-based framework for tomographic reconstruction that maps **sinograms** directly to **3D voxel volumes** through a hybrid neural–physics pipeline.
+The system is designed for *end-to-end differentiable training* with physically consistent projectors, supports slice-wise supervision, and uses **unfiltered backprojection (BP)** for reconstruction.
 
-## 🚀 Architecture Overview
+Key features:
 
-- **1D/2D Encoders**
-  - `Enc1_1D_Angle`: applies 1D convolutions along the **angle axis**, transforming input sinograms of shape `[B,1,U,A]` into feature maps `[B,C1,U,A]`.
-  - `Enc2_2D_Sino`: applies 2D convolutions over the **sinogram plane**, producing `[B,C2,U,A]` features.
+* Model-facing fixed conventions:
 
-- **Alignment Module**
-  - `Sino2XYAlign`: interpolates and aligns concatenated sinogram features into the 2D image domain, producing `[B,C_out,X,Y]`.
-
-- **Cheat Injection & Fusion**
-  - `VoxelCheat2D`: encodes the ground-truth voxel slice during training.
-  - `Fusion2D`: concatenates aligned sinogram features and cheat features along the channel axis. If cheat is disabled, zero-padding is used automatically.
-
-- **Decoder**
-  - `DecoderSlice2D`: processes fused features with multiple convolutional blocks and a 1×1 projection, outputting a single voxel slice.
-
-- **SVTR System**
-  - The `SVTRSystem` (implemented in `models/hdn.py`) combines the above modules into the forward pipeline:
-    1. Extracts features via 1D/2D encoders.
-    2. Aligns them to the voxel domain.
-    3. Optionally applies cheat injection and fusion.
-    4. Decodes into a reconstructed slice.
-
-- **Optional 3D Encoder**
-  - `Enc3_3D`: training-only prior that extracts hierarchical volumetric features from ground-truth 3D volumes.  
-    Not integrated into the default SVTR pipeline.
-
-- **Physics Modules**
-  - `physics/projector.py` and `physics/geometry.py` implement forward/back projectors and acquisition geometry for 3D parallel-beam CT.  
-    Currently not used in the default training loop, but available for testing or extended setups.
+  * Sinogram (x, a, z) → **\[B, 1, X, A, Z]**
+  * Volume (x, y, z)   → **\[B, 1, X, Y, Z]**
+* Encoders along angle (1D) and sinogram plane (2D).
+* Deterministic **Sino→XY alignment**.
+* Optional **voxel cheat path** for stabilized training.
+* Differentiable **Joseph forward** and **unfiltered BP** projector.
+* Training loss: **ExpandMaskedMSE**, focusing on in-part and near-boundary pixels.
 
 ---
 
-## ⚙️ Requirements
+## Project Structure & Key Modules
 
-- **Python**: 3.10.11  
-- **CUDA**: 12.9  
-- **Dependencies**: see `requirements.txt`
-  - `torch>=2.2`, `torchvision>=0.17`
-  - `numpy`, `scipy`, `einops`, `tqdm`, `pyyaml`
-  - Optional: `astra-toolbox>=2.1` (for validation only)
+### Data
+
+* **`data/dataset.py`**
+
+  * `ConcatDepthSliceDataset`: loads paired sinogram/voxel slices (`[U,A]`, `[X,Y]` per z).
+  * `SinogramVoxelVolumeDataset`: loads full volumes (`[U,A,D]`, `[X,Y,D]`).
+
+* **`data/io.py`**
+
+  * `ensure_sino_shape`, `ensure_voxel_shape`: strict validation of `[X,A,Z]` and `[X,Y,Z]`.
+  * Simple `load_npy`, `save_npy` helpers.
+
+### Geometry & Physics
+
+* **`physics/geometry.py`**
+
+  * `Parallel3DGeometry`: stores acquisition parameters (angles, voxel/detector spacing).
+  * Provides both legacy fields (ASTRA-style) and model-facing `(X,Y,Z)/(X,Z)` convenience.
+
+* **`physics/projector.py`**
+
+  * `JosephProjector3D`: voxel-driven forward projector, and **unfiltered slice-wise BP**.
+  * `SiddonProjector3D`: ray-driven reference projector (voxel intersection lengths).
+  * `make_projector`: factory function.
+
+* **`physics/psf.py`**
+
+  * `SeparableGaussianPSF2D`: optional Gaussian blur over sinograms (detector domain).
+
+### Model
+
+* **`models/enc1_1d.py`**
+
+  * `Enc1_1D_Angle`: extracts features along the angle axis (A).
+
+* **`models/enc2_2d.py`**
+
+  * `Enc2_2D_Sino`: 2D conv encoder over (X,A) slices.
+
+* **`models/align.py`**
+
+  * `Sino2XYAlign`: deterministic resize (X,A→X,Y) alignment.
+
+* **`models/fusion.py`**
+
+  * `VoxelCheat2D`: encodes GT voxel slices (train-only).
+  * `Fusion2D`: fuses sinogram-aligned and cheat features.
+
+* **`models/decoder.py`**
+
+  * `DecoderSlice2D`: 2D slice-wise voxel-plane decoder (alternative).
+  * `SinoDecoder2D`: maps fused XY features back to XA sinogram.
+
+* **`models/hdn.py`**
+
+  * `HDNSystem`: full pipeline wrapper:
+    `Enc1+Enc2 → Align → Cheat+Fusion → SinoDecoder → Projector.BP`.
+
+### Training & Utilities
+
+* **`train.py`**
+
+  * Group-wise slice training loop with AMP and gradient accumulation.
+  * Supports Adafactor or AdamW optimizer.
+  * Logging with `CSVLogger`.
+
+* **`losses/expand_mask_mse.py`**
+
+  * `ExpandMaskedMSE`: masked MSE loss with soft boundary targets (0.8–0.9).
+
+* **`utils/seed.py`**
+
+  * `set_seed`: reproducible RNG seeding and deterministic flags.
+
+* **`utils/yaml_config.py`**
+
+  * Load/save configs with safe YAML.
+
+* **`utils/logging.py`**
+
+  * `CSVLogger`: robust CSV logging with header management.
 
 ---
 
-## 📂 Repository Structure
+## Training & Execution
 
+### Config File (`config.yaml`)
+
+Example minimal config:
+
+```yaml
+data:
+  root: dataset
+  sino_glob: "sino/*_sino.npy"
+  voxel_glob: "voxel/*_voxel.npy"
+
+projector:
+  method: "joseph3d"
+
+geom:
+  voxel_size_xyz: [1.0, 1.0, 1.0]
+  det_spacing_xz: [1.0, 1.0]
+  angle_chunk: 16
+  n_steps_cap: 256
+
+model:
+  enc1: { base: 32, depth: 3 }
+  enc2: { base: 32, depth: 3 }
+  align: { out_ch: 64, depth: 2, interp_mode: "bilinear" }
+  cheat2d: { enabled: true, base: 16, depth: 2 }
+  fusion: { out_ch: 64 }
+  sino_dec: { mid_ch: 64, depth: 2, interp_mode: "bilinear" }
+
+losses:
+  expand_thr: 0.8
+  expand_spacing: null
+  expand_include_in: true
+  expand_in_value: 1.0
+  expand_boundary_low: 0.8
+  expand_boundary_high: 0.9
+  expand_clamp: true
+
+train:
+  seed: 1337
+  amp: true
+  optimizer: "adamw"
+  lr: 1.0e-4
+  weight_decay: 1.0e-3
+  batch_size: 8
+  num_workers: 2
+  grad_clip: 1.0
+  train_ratio: 0.8
+  files_per_group: 100
+  epochs: 1
+  ckpt_dir: "checkpoints/svtr"
+  flush_every: 10
+  empty_cache_every: 100
 ```
 
-SVTR/
-├── train.py                  # Main training loop
-├── config.yaml               # Training configuration
-├── models/                   # Encoders, Decoder, Fusion, SVTRSystem
-├── physics/                  # Projector, Geometry, PSF
-├── losses/                   # Loss functions
-├── data/                     # Dataset loaders
-├── optim/                    # Optimizers (Adafactor)
-├── scripts/                  # Utilities (dataset check, bucket maker)
-├── tests/                    # Unit tests
-├── utils/                    # Logging, metrics, config utilities
-
-````
-
----
-
-## 📝 Key Notes
-
-- The **core architecture** (1D/2D encoders → alignment → cheat injection & fusion → decoder) is **fully implemented** and stable.  
-- The **3D encoder (`Enc3_3D`)** and **physics-based projector modules** are implemented but **not integrated into the default SVTR training loop**.  
-- Thus, by default, SVTR training proceeds with 1D/2D encoders, alignment, optional cheat injection, and decoding.
-
----
-
-## ▶️ Usage
-
-### 1. Install requirements
-```bash
-pip install -r requirements.txt
-````
-
-### 2. Prepare dataset
-
-```
-data/
-├── sino/
-│   ├── 0001_sino.npy
-│   ├── 0002_sino.npy
-│   ...
-├── voxel/
-│   ├── 0001_voxel.npy
-│   ├── 0002_voxel.npy
-│   ...
-```
-
-### 3. Run training
+### Run Training
 
 ```bash
 python -m train --cfg config.yaml
 ```
 
-### 4. Run dataset check
+---
 
-```bash
-python -m scripts.check_dataset_integrity
+## Architecture Diagram
+
+```text
+Inputs & Conventions
+──────────────────────────────────────────────────────────────────────────────
+Sinogram (x,a,z): [B,1,X,A,Z]          Volume (x,y,z): [B,1,X,Y,Z]
+
+Pipeline (Training mode; Z=1 per minibatch slice)
+──────────────────────────────────────────────────────────────────────────────
+                ┌────────────────────────────────────────────────┐
+                │            Input Sinogram S[x,a,z]             │
+                │                 [B,1,X,A,Z]                    │
+                └───────────────┬────────────────────────────────┘
+                                │
+                ┌───────────────┴───────────────┐
+                │                               │
+        ┌───────▼───────┐               ┌───────▼───────┐
+        │ Enc1_1D_Angle │               │ Enc2_2D_Sino │
+        │ 1D over A     │               │ 2D over X×A  │
+        │[B,C1,X,A,Z]   │               │[B,C2,X,A,Z]  │
+        └───────┬───────┘               └───────┬───────┘
+                │               Concatenate     │
+                └───────────────┬───────────────┘
+                                ▼
+                       Sino2XYAlign (XA→XY)
+                         [B,Ca,X,Y,Z]
+                                │
+                ┌───────────────┴───────────────┐
+                │                               │
+        (train only)                          (eval)
+        ┌───────────────┐                    ┌──────┐
+        │ VoxelCheat2D  │  (GT slice)        │ None │
+        │[B,Cc,X,Y,Z]   │                    └──────┘
+        └───────────────┘
+                │
+                ├───────────────┐
+                │               │  (zeros auto‑injected if cheat disabled)
+                ▼               ▼
+                     Concatenate & Mix
+                          Fusion2D
+                        [B,Cf,X,Y,Z]
+                                │
+                                ▼
+                        SinoDecoder2D
+                      (XY→XA, clamp[0,1])
+                         [B,1,X,A,Z]
+                                │
+                                ▼
+          JosephProjector3D.backproject (Unfiltered BP)
+                         [B,1,X,Y,Z]
+                                │
+                                ▼
+      ┌─────────────────────────────────────────────────────┐
+      │  ExpandMaskedMSE (slice‑wise)                       │
+      │  • Mask = in‑part ∪ near‑boundary(out‑of‑part)     │
+      │  • Targets: in‑part=1.0, boundary∈[0.8..0.9]       │
+      │  • Far background = excluded from loss              │
+      └─────────────────────────────────────────────────────┘
+
+
+Inference (Evaluation / Full Volume)
+──────────────────────────────────────────────────────────────────────────────
+For each file pair:
+  for z = 0..D-1:
+    S[...,z] → Encoders → Align → Fusion (no cheat) → SinoDecoder2D
+             → Unfiltered BP → Recon[...,z]
+  Stack along z → Recon volume [X,Y,D]
+
+
+Shapes per Stage (Z=1 minibatch)
+──────────────────────────────────────────────────────────────────────────────
+Sino in          : [B,1,X,A,1]
+Enc1 out         : [B,C1,X,A,1]
+Enc2 out         : [B,C2,X,A,1]
+Aligned (XY)     : [B,Ca,X,Y,1]
+Cheat (optional) : [B,Cc,X,Y,1]
+Fused (XY)       : [B,Cf,X,Y,1]
+Sino decoded     : [B,1,X,A,1]
+Recon (BP)       : [B,1,X,Y,1]
+Loss slice input : pred/gt → [B,1,X,Y]
 ```
 
-### 5. Run unit tests
+Loss:
 
-```bash
-pytest tests/
-```
-
----
-
-## 🧪 Validation
-
-* **Adjoint consistency**: `tests/test_adjoint.py` checks forward/backprojector adjointness.
-* **One-step training test**: `tests/test_training_step.py` validates forward path with/without cheat injection.
-
----
-
-## 🔮 Planned Features
-
-These modules are implemented in prototype form but not yet supported in the default SVTR training path.
-They will be integrated in future updates:
-
-* **PSF (Point Spread Function):** separable Gaussian kernel, angle-dependent/invariant blurring.
-* **Forward Consistency Loss:** enforcing `FP(R_hat) ≈ S_in` as an additional physical constraint.
-* **3D Convolutions:** extending encoders/decoders with volumetric Conv3D layers for richer context.
-* **Physics-Based Models:** tighter integration of projectors and geometry into the SVTR training loop.
-
----
-
-## 🔒 Constraints
-
-* **FBP/FDK/iradon** are forbidden in training (allowed only for visualization/evaluation).
-* Reconstructions must satisfy:
-
-  * `sinogram >= 0`
-  * energy & dose-band constraints
-  * minimized IPDR (inverse projection data residual)
-
----
-
-## ✨ Citation
-
-Inspired by:
-
-* HDN: *High-Dimensional Neural Tomographic Reconstruction* (paper reference).
-* ASTRA Toolbox forward/backprojection operators.
----
-## 🧩 Architecture Diagram
-```
-      Input Sinogram Slice (U×A)
-                   │
-         ┌─────────┴─────────┐
-         │                   │
-     Enc1_1D             Enc2_2D
-         │                   │
-         └───── concat ──────┘
-                   │
-              Sino2XYAlign
-                   │
-             [B,Ca,X,Y]
-                   │
-         ┌─────────┴─────────┐
-         │                   │
-         │           VoxelCheat2D (train only)
-         │                   │
-         └───── Fusion2D ────┘
-                   │
-            DecoderSlice2D
-                   │
-         Predicted Voxel Slice
-```
+* `ExpandMaskedMSE(pred=recon2D, gt=voxel2D)` applied slice-wise,
+  masking out far background, weighting near-boundary with soft targets.
