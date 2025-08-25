@@ -7,6 +7,7 @@ data:  # ConcatDepthSliceDataset expects sino:[U(=X),A,D], voxel:[X,Y,D]. :conte
 
 projector:  # Backprojection uses the torch port of scikit-image iradon (slice-wise FBP). :contentReference[oaicite:2]{index=2}
   method: "joseph3d"   # {"joseph3d","siddon3d"}
+  fbp_filter: none
 
 geom:  # Parallel-beam 3D geometry in model-facing coords (X,Y,Z) and detector (X,Z). :contentReference[oaicite:3]{index=3}
   voxel_size_xyz: [1.0, 1.0, 1.0]   # (sx, sy, sz)
@@ -42,7 +43,7 @@ train:  # Seeding/AMP/optimizer/DL; matches sliced training loop in train.py.
   num_workers: 2
   grad_clip: 1.0
   grad_accum_steps: 1
-  train_ratio: 0.9         # depth-slice split within each group
+  train_ratio: 0.8         # depth-slice split within each group
   files_per_group: 100      # file pairs per training group
   epochs: 1               # used if epochs_per_group == 0
   epochs_per_group: 1      # per-group epochs; set 0 to use `epochs`

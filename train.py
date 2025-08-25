@@ -1,29 +1,63 @@
+"""
+Train HDN with **masked MSE only** and **unfiltered backprojection**.
+
+Pipeline (slice training with Z=1)
+----------------------------------
+Sino(x,a,z) → Enc1(A) + Enc2(XA) → Sino2XYAlign(XA→XY) → (optional) VoxelCheat2D →
+Fusion2D(XY) → SinoDecoder2D(XY→XA) → **JosephProjector3D.backproject (unfiltered)** →
+Recon(x,y,z) → ExpandMaskedMSE(pred=Recon2D, soft-boundary mask/targets from GT2D)
+
+Axis convention (model-facing, fixed)
+-------------------------------------
+• Sinogram : (x, a, z) → [B, 1, X, A, Z]
+• Volume   : (x, y, z) → [B, 1, X, Y, Z]
+
+Key components (repo refs)
+--------------------------
+• Config I/O / reproducibility / CSV logging: utils.yaml_config, utils.seed, utils.logging. 
+• Dataset (paired depth slices): data.dataset.ConcatDepthSliceDataset. :contentReference[oaicite:1]{index=1}
+• Geometry + projector factory (Joseph 3D BP): physics.geometry, physics.projector. 
+• HDN model (encoders/align/fusion/decoder + projector BP): models.hdn.HDNSystem. :contentReference[oaicite:3]{index=3}
+
+Notes
+-----
+• BP filter is **forced OFF** at runtime (`model.projector.ir_filter_name = None`) so the
+  backprojection is **unfiltered** (pure BP). :contentReference[oaicite:4]{index=4}
+• Loss is **ExpandMaskedMSE** only (in-part + near-boundary out-of-part soft labels),
+  averaged over the masked pixels per 2D slice.
+"""
+
 from pathlib import Path
+import math
+import gc
 import numpy as np
-import torch, gc, math
+import torch
 import torch.optim as optim
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 from torch.amp import GradScaler
 from torch import autocast
 
-from utils.yaml_config import load_config, save_effective_config
-from utils.seed import set_seed
-from utils.logging import CSVLogger
-from data.dataset import ConcatDepthSliceDataset
-from models.hdn import HDNSystem
-from physics.geometry import Parallel3DGeometry
-from physics.projector import make_projector
+from utils.yaml_config import load_config, save_effective_config           # :contentReference[oaicite:5]{index=5}
+from utils.seed import set_seed                                            # :contentReference[oaicite:6]{index=6}
+from utils.logging import CSVLogger                                        # :contentReference[oaicite:7]{index=7}
+from data.dataset import ConcatDepthSliceDataset                           # :contentReference[oaicite:8]{index=8}
+from models.hdn import HDNSystem                                           # :contentReference[oaicite:9]{index=9}
+from physics.geometry import Parallel3DGeometry                            # :contentReference[oaicite:10]{index=10}
+from physics.projector import make_projector                               # :contentReference[oaicite:11]{index=11}
+
 from losses.expand_mask_mse import ExpandMaskedMSE
 
 
 def _init_amp(device: torch.device, cfg: dict):
     """
-    Pick AMP dtype from config or hardware capability.
+    Decide AMP dtype and scaler.
 
     Returns
     -------
-    (enabled: bool, amp_dtype: torch.dtype, scaler: GradScaler)
+    enabled : bool
+    amp_dtype : torch.dtype
+    scaler : GradScaler
     """
     want = (cfg["train"].get("amp_dtype", "auto") or "auto").lower()
     if want == "bf16":
@@ -43,19 +77,12 @@ def evaluate_group_by_volume_mse(model: torch.nn.Module,
                                  device: torch.device,
                                  criterion: torch.nn.Module) -> float:
     """
-    Volumetric evaluation by **masked MSE only** (slice-wise, then averaged).
+    Volumetric evaluation by masked MSE only (slice-wise → per-volume mean → mean over files).
 
-    Protocol
-    --------
-    For each file pair in the dataset:
-      • Reconstruct each depth slice z with Z=1 (cheat OFF), get recon [1,1,X,Y].
-      • Compute `criterion(recon2d, gt2d)` per slice and average across depth.
-    Finally average across files.
-
-    Returns
-    -------
-    float
-        Mean masked MSE across all files.
+    For each file pair:
+      • For every depth d, run slice inference with Z=1 (cheat OFF).
+      • Compute `criterion(recon2d, gt2d)` per slice, average over depth.
+    Returns the mean over files.
     """
     model.eval()
     loss_sum = 0.0
@@ -69,11 +96,11 @@ def evaluate_group_by_volume_mse(model: torch.nn.Module,
             s_ua = np.array(s_mem[:, :, d], dtype=np.float32, copy=True, order="C")  # [U,A]
             v_xy = np.array(v_mem[:, :, d], dtype=np.float32, copy=True, order="C")  # [X,Y]
 
-            S = torch.from_numpy(s_ua).to(device).unsqueeze(0).unsqueeze(1).unsqueeze(-1)   # [1,1,X,A,1]
-            V = torch.from_numpy(v_xy).to(device).unsqueeze(0).unsqueeze(0)                 # [1,1,X,Y]
+            S = torch.from_numpy(s_ua).to(device).unsqueeze(0).unsqueeze(1).unsqueeze(-1)  # [1,1,X,A,1]
+            V = torch.from_numpy(v_xy).to(device).unsqueeze(0).unsqueeze(0)                # [1,1,X,Y]
 
             _, recon = model(S, v_vol=None, train_mode=False)   # [1,1,X,A,1], [1,1,X,Y,1]
-            R2 = recon[..., 0]                                  # [1,1,X,Y]
+            R2 = recon[..., 0]                                   # [1,1,X,Y]
 
             z_sum += float(criterion(R2, V).item())
 
@@ -85,23 +112,23 @@ def evaluate_group_by_volume_mse(model: torch.nn.Module,
 
 def main(cfg_path: str):
     """
-    Train HDN with **masked MSE only** on 2D slices (Z=1 per minibatch).
+    Train loop: masked-MSE-only slice training with unfiltered BP.
 
-    I/O shapes (model-facing)
-    -------------------------
-    • Sinogram  : [B, 1, X, A, Z] (x, a, z)
-    • Voxel GT  : [B, 1, X, Y, Z] (x, y, z)
-    • Recon out : [B, 1, X, Y, Z] (x, y, z)
+    Shapes (fixed)
+    --------------
+    • Input sino  : [B,1,X,A,1]
+    • GT voxel    : [B,1,X,Y,1]
+    • Recon out   : [B,1,X,Y,1]
     """
-    # --- Config / device / seeding ---------------------------------------------------------
-    cfg = load_config(cfg_path)
-    save_effective_config(cfg, Path(cfg_path).with_name("effective_config.json"))
+    # --- Config / device / seed ------------------------------------------------------------
+    cfg = load_config(cfg_path)                                                  # :contentReference[oaicite:12]{index=12}
+    save_effective_config(cfg, Path(cfg_path).with_name("effective_config.json"))# :contentReference[oaicite:13]{index=13}
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    set_seed(int(cfg["train"]["seed"]))  # deterministic flags inside. :contentReference[oaicite:1]{index=1}
+    set_seed(int(cfg["train"]["seed"]))                                          # :contentReference[oaicite:14]{index=14}
     amp_enabled, amp_dtype, scaler = _init_amp(device, cfg)
 
-    # --- Enumerate data into groups ---------------------------------------------------------
+    # --- Discover files & group them -------------------------------------------------------
     data_root = cfg.get("data", {}).get("root", "data")
     sino_glob = cfg.get("data", {}).get("sino_glob", "sino/*_sino.npy")
     voxel_glob = cfg.get("data", {}).get("voxel_glob", "voxel/*_voxel.npy")
@@ -115,16 +142,16 @@ def main(cfg_path: str):
     groups = [(all_sino[i:i + files_per_group], all_vox[i:i + files_per_group])
               for i in range(0, len(all_sino), files_per_group)]
 
-    # --- Logging / checkpoints --------------------------------------------------------------
+    # --- Logging ---------------------------------------------------------------------------
     Path("results").mkdir(parents=True, exist_ok=True)
     ckpt_dir = Path(cfg["train"]["ckpt_dir"]); ckpt_dir.mkdir(parents=True, exist_ok=True)
 
     csv_logger = CSVLogger(
         str(Path("results") / "train_log.csv"),
         fieldnames=["group", "epoch", "step", "loss", "running_avg", "vol_loss"],
-    )
+    )  # :contentReference[oaicite:15]{index=15}
 
-    # --- Loss: masked MSE with soft boundary targets ---------------------------------------
+    # --- Loss: ExpandMaskedMSE (soft boundary) ---------------------------------------------
     lcfg = cfg.get("losses", {})
     criterion = ExpandMaskedMSE(
         thr=float(lcfg.get("expand_thr", 0.8)),
@@ -163,7 +190,7 @@ def main(cfg_path: str):
             sino_paths=[str(p) for p in sino_paths],
             voxel_paths=[str(p) for p in voxel_paths],
             report=True,
-        )
+        )  # :contentReference[oaicite:16]{index=16}
         dl = DataLoader(
             ds,
             batch_size=int(cfg["train"]["batch_size"]),
@@ -184,23 +211,25 @@ def main(cfg_path: str):
             det_spacing_xz=tuple(map(float, cfg.get("geom", {}).get("det_spacing_xz", (1.0, 1.0)))),
             angle_chunk=int(cfg.get("geom", {}).get("angle_chunk", 16)),
             n_steps_cap=int(cfg.get("geom", {}).get("n_steps_cap", 256)),
-        )
+        )  # :contentReference[oaicite:17]{index=17}
 
         if model is None:
             projector = make_projector(str(cfg.get("projector", {}).get("method", "joseph3d")).lower(), geom).to(device)
-            model = HDNSystem(cfg, projector=projector).to(device)  # sino(x,a,z) → BP recon(x,y,z)
+            model = HDNSystem(cfg, projector=projector).to(device)
+
+
             if bool(cfg["train"].get("compile", False)) and hasattr(torch, "compile"):
                 model = torch.compile(model)
 
             if name == "adafactor":
-                from optim.adafactor import Adafactor  # memory‑efficient Adam variant. :contentReference[oaicite:2]{index=2}
+                from optim.adafactor import Adafactor
                 opt = Adafactor(model.parameters(), lr=lr, weight_decay=wd)
             else:
                 opt = optim.AdamW(model.parameters(), lr=lr, weight_decay=wd)
         else:
-            model.projector.reset_geometry(geom)  # update angles/shapes without rebuilding
+            model.projector.reset_geometry(geom)
 
-        # Train/val split **over depths** in this group (cheat ON only for train slices)
+        # Train/val split over depths in this group (cheat ON only for train slices)
         D_total = len(ds)
         all_z = np.arange(D_total)
         rng = np.random.RandomState(int(cfg["train"]["seed"]) + g_idx)
@@ -217,7 +246,7 @@ def main(cfg_path: str):
                 steps += 1
 
                 # Batch tensors
-                S_ua = batch["sino_ua"].to(device, non_blocking=True)   # [B,U,A] ≡ [B,X,A]
+                S_ua = batch["sino_ua"].to(device, non_blocking=True)   # [B,U,A]
                 V_gt = batch["voxel_xy"].to(device, non_blocking=True)  # [B,1,X,Y]
 
                 # Canonicalize to model I/O
@@ -233,7 +262,7 @@ def main(cfg_path: str):
                     loss_tensor = criterion(R2, V_gt)    # scalar masked MSE on 2D slice
                     loss = loss_tensor.mean() / accum_steps
 
-                # Backprop + update (AMP‑aware)
+                # Backprop + update (AMP-aware)
                 if scaler.is_enabled():
                     scaler.scale(loss).backward()
                 else:
@@ -295,7 +324,7 @@ def main(cfg_path: str):
 
 if __name__ == "__main__":
     import argparse
-    ap = argparse.ArgumentParser(description="Train HDN with masked MSE only (x,a,z)/(x,y,z) slice training.")
+    ap = argparse.ArgumentParser(description="Train HDN with masked MSE only (unfiltered BP).")
     ap.add_argument("--cfg", type=str, default="config.yaml", help="Path to YAML config.")
     args = ap.parse_args()
     main(args.cfg)
