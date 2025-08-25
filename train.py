@@ -49,6 +49,9 @@ from physics.projector import make_projector                               # :co
 from losses.expand_mask_mse import ExpandMaskedMSE
 
 
+def _as_float(x):
+    return float(x) if not torch.is_tensor(x) else float(x.detach().item())
+
 def _init_amp(device: torch.device, cfg: dict):
     """
     Decide AMP dtype and scaler.
@@ -285,7 +288,7 @@ def main(cfg_path: str):
                     ema = step_loss if ema is None else (beta * ema + (1.0 - beta) * step_loss)
                     running_avg = ema / (1.0 - beta ** steps)
                     
-                mse_val = float(step_loss.detach().item())
+                mse_val = _as_float(step_loss)
                 val_total = mse_val
 
                 csv_logger.log(
