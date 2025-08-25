@@ -7,7 +7,7 @@ from .enc1_1d import Enc1_1D_Angle                 # [B,1,X,A,Z] → [B,C1,X,A,Z
 from .enc2_2d import Enc2_2D_Sino                  # [B,1,X,A,Z] → [B,C2,X,A,Z]
 from .align   import Sino2XYAlign                  # [B,C,X,A,Z] → [B,Ca,X,Y,Z]
 from .fusion  import VoxelCheat2D, Fusion2D        # [B,*,X,Y,Z] fuse
-# DecoderSlice2D는 여기선 사용하지 않음(시노그램을 디코딩해야 하므로).
+from physics.psf import SeparableGaussianPSF2D     # optional PSF over sino(x,a,z)
 
 
 # ------------------------------------------------------------------------------------------
@@ -46,7 +46,7 @@ class SinoDecoder2D(nn.Module):
                 nn.GroupNorm(num_groups=max(1, min(ch[i + 1], 8)), num_channels=ch[i + 1]),
                 nn.ReLU(inplace=True),
             ]
-        # 최종 1×1로 채널 1개(시노그램)를 출력
+        # final 1×1 to 1-channel sinogram
         self.mix = nn.Sequential(*layers)
         self.proj = nn.Conv2d(ch[-1], 1, kernel_size=1, stride=1, padding=0, bias=True)
 
@@ -68,25 +68,24 @@ class SinoDecoder2D(nn.Module):
         """
         if F_xy.dim() == 5:
             B, C, X, Y, Z = F_xy.shape
-            # [B,C,X,Y,Z] → [B,Z,C,X,Y] → [B*Z,C,X,Y]
             x = F_xy.permute(0, 4, 1, 2, 3).contiguous().view(B * Z, C, X, Y)
-        elif F_xy.dim() == 4:  # Z=1 처리
+        elif F_xy.dim() == 4:  # Z=1
             B, C, X, Y = F_xy.shape
             Z = 1
             x = F_xy.view(B * Z, C, X, Y)
         else:
             raise ValueError(f"SinoDecoder2D expects [B,C,X,Y,(Z)], got {tuple(F_xy.shape)}")
 
-        # Conv mixing (해상도 유지)
+        # Conv mixing (resolution preserved)
         x = self.mix(x)  # [B*Z, mid, X, Y]
 
-        # Y → A로 크기 변경
+        # Y → A resize
         if self.mode in ("bilinear", "bicubic"):
             x = F.interpolate(x, size=(X, A), mode=self.mode, align_corners=False)
         else:
             x = F.interpolate(x, size=(X, A), mode=self.mode)
 
-        # 1×1로 1채널 시노그램 생성
+        # 1×1 projection to sinogram
         x = self.proj(x)  # [B*Z, 1, X, A]
 
         # [B*Z,1,X,A] → [B,1,X,A,Z]
@@ -100,42 +99,18 @@ class HDNSystem(nn.Module):
 
     Pipeline
     --------
-    1) Enc1_1D_Angle: A축 1D 인코딩 → [B,C1,X,A,Z]
-    2) Enc2_2D_Sino : (X,A) 2D 인코딩 → [B,C2,X,A,Z]
-    3) Sino2XYAlign : (X,A) 특징을 (X,Y)로 정렬 → [B,Ca,X,Y,Z]
-    4) (옵션) VoxelCheat2D: GT voxel → [B,Cc,X,Y,Z]
-    5) Fusion2D      : 정렬 특징 + 치트 특징 융합 → [B,Cf,X,Y,Z]
-    6) SinoDecoder2D : (X,Y) 융합 특징 → **시노그램 [B,1,X,A,Z]**
-    7) Projector.BP  : **백프로젝션**으로 **리컨 [B,1,X,Y,Z]**
-
-    Args
-    ----
-    cfg : dict
-        Model config. Keys (with defaults):
-        - enc1   : {"base": 32, "depth": 3}
-        - enc2   : {"base": 32, "depth": 3}
-        - align  : {"out_ch": 64, "depth": 2, "interp_mode": "bilinear"}
-        - cheat2d: {"enabled": True, "base": 16, "depth": 2}
-        - fusion : {"out_ch": 64}
-        - sino_dec: {"mid_ch": 64, "depth": 2, "interp_mode": "bilinear"}
-    projector : nn.Module
-        Must implement `backproject(sino_xaz: [B,C,X,A,Z]) -> [B,C,X,Y,Z]`. For example,
-        `JosephProjector3D` or `SiddonProjector3D`(우리 수정 버전).  # noqa
-
-    I/O (model-facing, 고정)
-    ------------------------
-    Input :
-        sino_xaz : [B, 1, X, A, Z]  — measured/input sinogram
-        v_vol    : [B, 1, X, Y, Z]  — optional GT voxel for cheat path (train only)
-    Output:
-        sino_hat_xaz : [B, 1, X, A, Z]  — decoder-predicted (optimized) sinogram
-        recon_xyz    : [B, 1, X, Y, Z]  — BP reconstruction from `sino_hat_xaz`
+    1) Enc1_1D_Angle: A-axis 1D encoding → [B,C1,X,A,Z]
+    2) Enc2_2D_Sino : (X,A) 2D encoding → [B,C2,X,A,Z]
+    3) Sino2XYAlign : (X,A) features → (X,Y) alignment → [B,Ca,X,Y,Z]
+    4) (optional) VoxelCheat2D: GT voxel → [B,Cc,X,Y,Z]
+    5) Fusion2D      : fuse aligned+cheat → [B,Cf,X,Y,Z]
+    6) SinoDecoder2D : (X,Y) → **sino [B,1,X,A,Z]**
+    7) Projector.BP  : **backproject** → **recon [B,1,X,Y,Z]**
 
     Notes
     -----
-    • 치트 경로는 (train_mode=True AND cheat_enabled AND v_vol 제공)일 때만 활성화.
-    • (X,Y) 정렬 크기는 projector.geom에서 가져와 일관성 보장.
-    • 축/형상 규약은 데이터셋과 동일하게 (x,a,z)/(x,y,z)로 고정.  # 중요
+    • Cheat path is active only when `train_mode=True` and GT volume is provided.
+    • Target Y is taken from `projector.geom.H` to keep alignment consistent.
     """
 
     def __init__(self, cfg: dict, projector: nn.Module):
@@ -144,9 +119,9 @@ class HDNSystem(nn.Module):
             raise ValueError("projector must be provided and implement .backproject().")
         self.projector = projector
 
-        m = cfg.get("model", cfg)  # 허용: 바로 model dict가 올 수도 있음
+        m = cfg.get("model", cfg)
 
-        # 1D/2D 인코더 (시노그램 도메인)
+        # 1D/2D encoders (sinogram domain)
         self.enc1 = Enc1_1D_Angle(
             base=int(m.get("enc1", {}).get("base", 32)),
             depth=int(m.get("enc1", {}).get("depth", 3)),
@@ -156,7 +131,7 @@ class HDNSystem(nn.Module):
             depth=int(m.get("enc2", {}).get("depth", 3)),
         )
 
-        # (X,A) → (X,Y) 정렬
+        # (X,A) → (X,Y) alignment
         align_cfg = m.get("align", {})
         self.align = Sino2XYAlign(
             in_ch=self.enc1.out_ch + self.enc2.out_ch,
@@ -165,7 +140,7 @@ class HDNSystem(nn.Module):
             mode=str(align_cfg.get("interp_mode", "bilinear")),
         )
 
-        # 치트 인코더 (옵션)
+        # Cheat encoder (optional)
         c_cfg = m.get("cheat2d", {})
         self.cheat_enabled = bool(c_cfg.get("enabled", True))
         self.cheat = VoxelCheat2D(
@@ -173,20 +148,29 @@ class HDNSystem(nn.Module):
             depth=int(c_cfg.get("depth", 2)),
         )
 
-        # 융합
+        # Fusion
         self.fusion = Fusion2D(
             in_ch_sino=int(align_cfg.get("out_ch", 64)),
             in_ch_cheat=(self.cheat.out_ch if self.cheat_enabled else 0),
             out_ch=int(m.get("fusion", {}).get("out_ch", 64)),
         )
 
-        # 시노 디코더 (XY → XA)
+        # Sinogram decoder (XY → XA)
         sd_cfg = m.get("sino_dec", {})
         self.sino_dec = SinoDecoder2D(
             in_ch=self.fusion.out_ch,
             mid_ch=int(sd_cfg.get("mid_ch", 64)),
             depth=int(sd_cfg.get("depth", 2)),
             mode=str(sd_cfg.get("interp_mode", align_cfg.get("interp_mode", "bilinear"))),
+        )
+
+        # Optional PSF over sino(x,a,z)
+        psf_cfg = cfg.get("psf", {})
+        self.psf = SeparableGaussianPSF2D(
+            enabled=bool(psf_cfg.get("enabled", False)),
+            angle_variant=bool(psf_cfg.get("angle_variant", False)),
+            sigma_u=float(psf_cfg.get("sigma_u", 0.7)),
+            sigma_v=float(psf_cfg.get("sigma_v", 0.7)),
         )
 
     # ----------------------------
@@ -249,40 +233,42 @@ class HDNSystem(nn.Module):
 
         B, _, X, A, Z = S.shape
 
-        # Sanity with geometry
+        # Y target from geometry (if available)
         geom = getattr(self.projector, "geom", None)
         if geom is not None:
             if A != geom.A:
                 raise ValueError(f"A mismatch: input A={A} vs geom.A={geom.A}")
-            Xg, Yg, Zg = geom.W, geom.H, geom.D  # 내부: (W→X, H→Y, D→Z)
-            if (X != Xg) or (Z != Zg):
-                # X,Z는 지오메트리와 맞추는 게 안전. (Y는 정렬에서 사용)
-                pass  # 경고만. 강제하지 않음.
-            Y_target = Yg
+            Y_target = geom.H
         else:
-            # geometry가 없으면 v_vol에서 Y를 가져오거나 X로 fallback
             Y_target = (V.shape[3] if V is not None else X)
 
-        # 1) 시노그램 인코딩 (x,a,z)
+        # 1) Sinogram encoders (x,a,z)
         f1 = self.enc1(S)                         # [B,C1,X,A,Z]
         f2 = self.enc2(S)                         # [B,C2,X,A,Z]
         f_sino = torch.cat([f1, f2], dim=1)       # [B,C1+C2,X,A,Z]
 
-        # 2) (X,A) → (X,Y) 정렬
+        # 2) (X,A) → (X,Y) alignment
         f_xy = self.align(f_sino, (X, Y_target))  # [B,Ca,X,Y,Z]
 
-        # 3) 치트 특징 (옵션) + 융합 (XY 도메인)
+        # 3) Cheat features (optional) + fusion (XY domain)
         if self.cheat_enabled and train_mode and (V is not None):
             cheat_xy = self.cheat(V)              # [B,Cc,X,Y,Z]
             fused_xy = self.fusion(f_xy, cheat_xy)  # [B,Cf,X,Y,Z]
         else:
             fused_xy = self.fusion(f_xy, None)      # [B,Cf,X,Y,Z]
 
-        # 4) 시노 디코더 (XY → XA): 디코더의 **추론 시노그램(x,a,z)**
+        # 4) Sinogram decoder (XY → XA): predicted sinogram (x,a,z)
         sino_hat_xaz = self.sino_dec(fused_xy, A=A)  # [B,1,X,A,Z]
 
-        # 5) BP로 **리컨(x,y,z)** 생성
-        recon_xyz = self.projector.backproject(sino_hat_xaz)  # [B,1,X,Y,Z]
+        # 5) Optional PSF before backprojection
+        sino_for_bp = sino_hat_xaz
+        if self.psf.enabled:
+            if self.psf.angle_variant and self.psf._A != A:
+                self.psf.configure(A, device=sino_for_bp.device, dtype=sino_for_bp.dtype)
+            sino_for_bp = self.psf(sino_for_bp)  # [B,1,X,A,Z]
+
+        # 6) Backprojection to reconstruction (x,y,z)
+        recon_xyz = self.projector.backproject(sino_for_bp)  # [B,1,X,Y,Z]
         recon_xyz = recon_xyz.clamp_(0.0, 1.0)
 
         return sino_hat_xaz, recon_xyz

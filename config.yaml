@@ -1,78 +1,52 @@
-# =============================================================================
-# Example YAML configuration for HDN/SVTR training with pixel-level loss.
-#
-# This configuration uses the default dataset layout where sinograms have
-# shape [U, A, D] and voxels [X, Y, D]【511144253987820†L17-L23】.  Each item
-# returned by the dataset corresponds to a single depth slice: a sinogram
-# slice of size [U, A] and a voxel slice of size [1, X, Y]【511144253987820†L75-L99】.
-#
-# The ``losses.weights`` section includes a new ``l1`` weight which controls
-# the pixel-wise L1 loss.  During training, this L1 term is combined with
-# structural similarity (SSIM) and peak signal-to-noise ratio (PSNR) to
-# encourage accurate and stable reconstructions.  All weights are
-# automatically normalised to sum to 1.0 inside the training script.
-#
-# Set ``cheat2d.enabled`` to true or false depending on whether you want to
-# inject ground-truth voxel features during training.  When evaluating
-# (train_mode=False), cheat injection is disabled to avoid leaking GT
-# information【511144253987820†L75-L99】.
-#
-# Forward-projection consistency can be enabled by setting ``fp`` to a
-# positive value; this will use the differentiable radon transform to
-# compare the predicted reconstruction's sinogram with the ground truth.
-#
-# References:
-# - ASTRA forward projection algorithm takes a projector and a volume
-#   and returns projection data【34246792875788†L36-L40】.
-# - VAMToolbox’s FBP stage introduces negative intensities which we
-#   clamp to [0,1] in the decoder【508774924062640†L39-L44】.
-# =============================================================================
-data:
+# Minimal config for HDN + Joseph FBP, training with **masked MSE only** over 2D slices. 
+
+data:  # ConcatDepthSliceDataset expects sino:[U(=X),A,D], voxel:[X,Y,D]. :contentReference[oaicite:1]{index=1}
   root: dataset
   sino_glob: "sino/*_sino.npy"
   voxel_glob: "voxel/*_voxel.npy"
-  resample_u: false
 
-model:
-  enc1:    { base: 64, depth: 8 }
-  enc2:    { base: 64, depth: 8 }
-  align:   { out_ch: 96, depth: 8, interp_mode: bilinear }
-  cheat2d: { enabled: false, base: 64, depth: 8 }
-  fusion:  { out_ch: 128 }
-  sino_dec: { mid_ch: 128, depth: 8, interp_mode: bilinear }
+projector:  # Backprojection uses the torch port of scikit-image iradon (slice-wise FBP). :contentReference[oaicite:2]{index=2}
+  method: "joseph3d"   # {"joseph3d","siddon3d"}
 
-train:
+geom:  # Parallel-beam 3D geometry in model-facing coords (X,Y,Z) and detector (X,Z). :contentReference[oaicite:3]{index=3}
+  voxel_size_xyz: [1.0, 1.0, 1.0]   # (sx, sy, sz)
+  det_spacing_xz: [1.0, 1.0]        # (su, sv)
+  angle_chunk: 16                   # angles processed per loop
+  n_steps_cap: 256                  # Joseph forward sampling cap
+
+model:  # HDN pipeline: Enc1+Enc2 → Align(XA→XY) → (optional)Cheat → Fusion → SinoDecoder → FBP. :contentReference[oaicite:4]{index=4}
+  enc1:   { base: 32, depth: 3 }                 # Enc1_1D_Angle over A. :contentReference[oaicite:5]{index=5}
+  enc2:   { base: 32, depth: 3 }                 # Enc2_2D_Sino over (X,A). :contentReference[oaicite:6]{index=6}
+  align:  { out_ch: 64, depth: 2, interp_mode: "bilinear" }  # Sino2XYAlign (X,A)->(X,Y). :contentReference[oaicite:7]{index=7}
+  cheat2d: { enabled: true, base: 16, depth: 2 }  # VoxelCheat2D (train-only). :contentReference[oaicite:8]{index=8}
+  fusion: { out_ch: 64 }                         # Fusion2D on (X,Y). :contentReference[oaicite:9]{index=9}
+  sino_dec: { mid_ch: 64, depth: 2, interp_mode: "bilinear" }  # XY→XA. :contentReference[oaicite:10]{index=10}
+
+losses:  # ExpandMaskedMSE only (soft boundary targets + mask). Params consumed by train.py. 
+  expand_thr: 0.8              # boundary band distance (pixels)
+  expand_spacing: null         # e.g., [dy, dx] for anisotropy; null → pixel units
+  expand_include_in: true      # include in-part (gt==1) in the mask
+  expand_in_value: 1.0         # target inside in-part
+  expand_boundary_low: 0.8     # target at outer edge of band
+  expand_boundary_high: 0.9    # target at inner edge (adjacent to in-part)
+  expand_clamp: true           # clamp pred/gt to [0,1] before loss
+
+train:  # Seeding/AMP/optimizer/DL; matches sliced training loop in train.py. 
   seed: 1337
-  files_per_group: 10
-  epochs_per_group: 1
-  epochs: 5
-  batch_size: 5
-  lr: 1.0e-5
-  weight_decay: 1.0e-5
-  optimizer: "adamw"
-  grad_accum_steps: 1
   amp: true
-  amp_dtype: "auto"
-  compile: false
+  amp_dtype: "auto"        # {"auto","bf16","fp16"}
+  optimizer: "adamw"       # {"adamw","adafactor"}; Adafactor is available. :contentReference[oaicite:12]{index=12}
+  lr: 1.0e-4
+  weight_decay: 1.0e-3
+  batch_size: 8
   num_workers: 2
-  ckpt_dir: "results"
-  flush_every: 100
-  empty_cache_every: 10
   grad_clip: 1.0
-  train_ratio: 0.7
-
-losses:
-  weights:
-    l1:     0.1
-    l2:     0.0
-    ssim:   0.1
-    psnr:   0.1
-    band:   0.2
-    energy: 0.2
-    ver:    0.3
-    ipdr:   0.0
-    tv:     0.0
-    fp:     0.0
-  band_low:  0.0
-  band_high: 1.0
-  ver_thr:   0.1
+  grad_accum_steps: 1
+  train_ratio: 0.9         # depth-slice split within each group
+  files_per_group: 100      # file pairs per training group
+  epochs: 1               # used if epochs_per_group == 0
+  epochs_per_group: 1      # per-group epochs; set 0 to use `epochs`
+  ckpt_dir: "checkpoints/hdn_josephfbp_mse"
+  compile: false           # torch.compile
+  flush_every: 10          # CSV flush cadence (steps). :contentReference[oaicite:13]{index=13}
+  empty_cache_every: 100   # CUDA cache GC cadence (steps)
