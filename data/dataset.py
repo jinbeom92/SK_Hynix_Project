@@ -10,25 +10,6 @@ from torch.utils.data import Dataset
 # ==========================================================================================
 
 def _load_sino_uaD(path: str) -> np.memmap:
-    """
-    Memory-map a sinogram .npy file.
-
-    Expected shape
-    --------------
-    [U, A, D] where
-      U: detector bins (≡ X),
-      A: projection angles,
-      D: depth slices (≡ Z).
-
-    If input is [U, A], it will be reshaped to [U, A, 1].
-
-    Notes
-    -----
-    * We keep ASTRA's native 3D convention (u, angles, v) at load-time
-      as [U, A, D]; the model-facing volume class permutes to z-first.
-      When you call ASTRA backprojection, pass [U, A, D] again by
-      transposing back from the model layout.
-    """
     arr = np.load(path, mmap_mode="r")
     if arr.ndim == 2:  # upgrade to [U,A,1]
         U, A = arr.shape
@@ -39,14 +20,6 @@ def _load_sino_uaD(path: str) -> np.memmap:
 
 
 def _load_voxel_xyD(path: str) -> np.memmap:
-    """
-    Memory-map a voxel volume .npy file.
-
-    Expected shape
-    --------------
-    [X, Y, D] where D is the z-depth. If input is [X, Y], it will be
-    reshaped to [X, Y, 1].
-    """
     arr = np.load(path, mmap_mode="r")
     if arr.ndim == 2:  # upgrade to [X,Y,1]
         X, Y = arr.shape
@@ -61,18 +34,6 @@ def _load_voxel_xyD(path: str) -> np.memmap:
 # ==========================================================================================
 
 class ConcatDepthSliceDataset(Dataset):
-    """
-    Paired sinogram/voxel **slice** dataset.
-
-    Each index corresponds to a single depth slice d=z. Returns:
-      - "sino_ua":  torch.FloatTensor [U, A]    (≡ [X, A] at that z)
-      - "voxel_xy": torch.FloatTensor [1, X, Y] (channel-first for 2D conv)
-      - indices/meta for bookkeeping.
-
-    This class does not permute axes beyond extracting the slice.
-    It is useful when the model iterates over z one plane at a time
-    (e.g., 1D conv along X per angle and 2D conv on (X,A) per z).
-    """
     def __init__(self,
                  data_root: str = "data",
                  sino_glob: str = "sino/*_sino.npy",
@@ -165,16 +126,6 @@ class ConcatDepthSliceDataset(Dataset):
         return self.D_total
 
     def __getitem__(self, idx: int):
-        """
-        Returns
-        -------
-        dict
-          - "sino_ua":  torch.FloatTensor [U, A]
-          - "voxel_xy": torch.FloatTensor [1, X, Y]
-          - "pair_index": int
-          - "local_z":   int
-          - "global_z":  int
-        """
         f, d = self.index[idx]
         s = self.sinos[f][:, :, d]   # [U,A]
         v = self.voxels[f][:, :, d]  # [X,Y]
@@ -194,24 +145,6 @@ class ConcatDepthSliceDataset(Dataset):
 # ==========================================================================================
 
 class SinogramVoxelVolumeDataset(Dataset):
-    """
-    Paired sinogram/voxel **volume** dataset.
-
-    Each index corresponds to one file-pair. Returns:
-      - "sino_d_u_a":   torch.FloatTensor [D(=Z), U(=X), A]
-      - "voxel_d_x_y":  torch.FloatTensor [D(=Z), X, Y]
-      - "pair_index":   int
-
-    Why z-first?
-    ------------
-    Your encoder slices along z to get (X,A), then along A to feed 1D conv
-    across X; having z as the leading dim makes `sino[d] -> (X,A)` trivial.
-
-    ASTRA interop
-    -------------
-    ASTRA 3D expects sinograms as [U, A, D]. If you pass tensors from this
-    dataset to ASTRA, transpose back with `.permute(1, 2, 0)` to [U,A,D].
-    """
     def __init__(self,
                  data_root: str = "data",
                  sino_glob: str = "sino/*_sino.npy",
@@ -286,14 +219,6 @@ class SinogramVoxelVolumeDataset(Dataset):
         return len(self.sinos)
 
     def __getitem__(self, idx: int):
-        """
-        Returns
-        -------
-        dict
-          - "sino_d_u_a":  torch.FloatTensor [D, U, A]  (z-first layout for the model)
-          - "voxel_d_x_y": torch.FloatTensor [D, X, Y]  (z-first layout for the model)
-          - "pair_index":  int
-        """
         s_mem = self.sinos[idx]   # [U, A, D]
         v_mem = self.voxels[idx]  # [X, Y, D]
 

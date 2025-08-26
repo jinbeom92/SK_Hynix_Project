@@ -4,23 +4,6 @@ import torch.nn.functional as F
 
 
 def _gaussian_kernel1d(sigma: float, radius: int = None, device=None, dtype=None):
-    """
-    Build a normalized 1D Gaussian kernel.
-
-    Parameters
-    ----------
-    sigma : float
-        Standard deviation of the Gaussian. If ``sigma <= 0``, returns identity kernel ``[1.0]``.
-    radius : int, optional
-        Kernel radius. If None, uses ``ceil(3*sigma)`` to capture ~99.7% mass.
-    device, dtype :
-        Torch device/dtype for the returned tensor.
-
-    Returns
-    -------
-    Tensor
-        1D kernel ``[K]`` with ``K = 2*radius + 1``, normalized to sum=1.
-    """
     if sigma <= 0:
         k = torch.tensor([1.0], device=device, dtype=dtype)
         return k / k.sum()
@@ -33,57 +16,6 @@ def _gaussian_kernel1d(sigma: float, radius: int = None, device=None, dtype=None
 
 
 class SeparableGaussianPSF2D(torch.nn.Module):
-    """
-    Separable Gaussian PSF over sinograms in **(x, a, z)** layout.
-
-    Purpose
-    -------
-    Apply a separable 2D Gaussian blur along **detector‑z** and **detector‑x**
-    axes of the sinogram. This can emulate detector/geometry blur while keeping
-    the angle axis intact.
-
-    Axis convention (model-facing)
-    ------------------------------
-    Sinogram: **(x, a, z)** → tensors shaped **[B, C?, X, A, Z]**.
-      - Blur is applied along **Z (vertical detector v)** and **X (horizontal detector u)**.
-      - The angle axis **A** is never convolved.
-
-    Modes
-    -----
-    - ``angle_variant=False`` (default):
-        Use single ``sigma_u/sigma_v`` for all angles. No configuration call required.
-    - ``angle_variant=True``:
-        Use per‑angle sigma vectors. **You must call**
-        ``configure(A, device, dtype, sigma_u_vec, sigma_v_vec)`` **before** forward.
-
-    Parameters
-    ----------
-    enabled : bool
-        Master enable switch. If False, forward is identity.
-    angle_variant : bool
-        Use per‑angle sigma vectors if True.
-    sigma_u : float
-        Base σ along detector‑u (**X** axis).
-    sigma_v : float
-        Base σ along detector‑v (**Z** axis).
-
-    Attributes
-    ----------
-    _sigma_u, _sigma_v :
-        - angle_variant=False → scalar tensors (device/dtype aware).
-        - angle_variant=True  → per‑angle tensors shaped ``[A]``.
-    _A : int
-        Cached number of angles after ``configure``.
-
-    Notes
-    -----
-    • Implementation uses two 1D convolutions (separable blur): first **Z**, then **X**.
-    • Gaussian is symmetric → under zero‑padding, **PSF^T = PSF** (self‑adjoint).
-    • Kernels are built in the input dtype for safe mixed‑precision conv.
-    • This PSF is differentiable w.r.t. inputs; σ’s are not learnable here
-      because kernels are created outside autograd.
-    """
-
     def __init__(self, enabled: bool = False, angle_variant: bool = False,
                  sigma_u: float = 0.7, sigma_v: float = 0.7):
         super().__init__()
@@ -101,26 +33,6 @@ class SeparableGaussianPSF2D(torch.nn.Module):
     def configure(self, A: int, device: torch.device, dtype: torch.dtype = torch.float32,
                   sigma_u_vec: Optional[torch.Tensor] = None,
                   sigma_v_vec: Optional[torch.Tensor] = None):
-        """
-        Prepare per-angle sigma tensors for the active geometry.
-
-        Required when
-        -------------
-        ``angle_variant=True`` (otherwise optional).
-
-        Parameters
-        ----------
-        A : int
-            Number of projection angles.
-        device : torch.device
-            Target device for internal buffers.
-        dtype : torch.dtype
-            Dtype for internal buffers (default float32).
-        sigma_u_vec : Tensor, optional
-            ``[A]`` σ_u per angle; if None, filled with ``base_sigma_u``.
-        sigma_v_vec : Tensor, optional
-            ``[A]`` σ_v per angle; if None, filled with ``base_sigma_v``.
-        """
         self._A = int(A)
         if self.angle_variant:
             if sigma_u_vec is None or sigma_v_vec is None:
@@ -134,14 +46,6 @@ class SeparableGaussianPSF2D(torch.nn.Module):
             self._sigma_v = torch.tensor(self.base_sigma_v, device=device, dtype=dtype)
 
     def _canon(self, sino: torch.Tensor):
-        """
-        Canonicalize input to **[B, C, X, A, Z]** and remember if channel was absent.
-
-        Accepted shapes
-        ---------------
-        - [B, X, A, Z]      → unsqueeze channel dim (C=1)
-        - [B, C, X, A, Z]   → returned as-is
-        """
         if sino.dim() == 4:   # [B,X,A,Z]
             return sino.unsqueeze(1), True
         if sino.dim() == 5:   # [B,C,X,A,Z]
@@ -149,28 +53,6 @@ class SeparableGaussianPSF2D(torch.nn.Module):
         raise ValueError(f"sino must be [B,X,A,Z] or [B,C,X,A,Z], got {tuple(sino.shape)}")
 
     def forward(self, sino: torch.Tensor) -> torch.Tensor:
-        """
-        Apply PSF (forward operator).
-
-        Parameters
-        ----------
-        sino : Tensor
-            Sinogram in **(x, a, z)** layout. Accepted shapes:
-            - ``[B, X, A, Z]``
-            - ``[B, C, X, A, Z]``
-
-        Returns
-        -------
-        Tensor
-            Blurred sinogram with the **same shape** as input.
-
-        Implementation
-        --------------
-        - angle_variant=True:
-            loop over angles and apply per-angle 1D conv along **Z** then **X**.
-        - angle_variant=False:
-            vectorized: pack ``(B, C, A)`` into batch and apply shared kernels once.
-        """
         if not self.enabled:
             return sino
 
@@ -213,13 +95,4 @@ class SeparableGaussianPSF2D(torch.nn.Module):
         return out.squeeze(1) if squeezed else out
 
     def transpose(self, sino: torch.Tensor) -> torch.Tensor:
-        """
-        Apply the transpose operator :math:`PSF^T`. For symmetric Gaussian kernels
-        under zero padding, this equals ``forward(sino)``.
-
-        Returns
-        -------
-        Tensor
-            Same as ``forward(sino)``.
-        """
         return self.forward(sino)

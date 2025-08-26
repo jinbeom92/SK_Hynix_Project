@@ -26,8 +26,8 @@
 
 data:
   root: dataset
-  sino_glob: "sino/*_sino.npy"
-  voxel_glob: "voxel/*_voxel.npy"
+  sino_glob: "sino_gt/*_sino.npy"
+  voxel_glob: "voxel_gt/*_voxel.npy"
 
 projector:
   method: "joseph3d"
@@ -45,6 +45,7 @@ model:
   cheat2d: { enabled: true, base: 16, depth: 2 }
   fusion: { out_ch: 64 }
   sino_dec: { mid_ch: 64, depth: 2, interp_mode: "bilinear" }
+  clamp_recon: true
 
 losses:
   expand_thr: 0.8
@@ -53,7 +54,7 @@ losses:
   expand_in_value: 1.0
   expand_boundary_low: 0.8
   expand_boundary_high: 0.9
-  expand_clamp: true
+  expand_clamp: false
 
 train:
   seed: 1337
@@ -67,10 +68,10 @@ train:
   grad_clip: 1.0
   grad_accum_steps: 1
   train_ratio: 0.8
-  files_per_group: 100
+  files_per_group: 10
   epochs: 1
-  epochs_per_group: 1
-  ckpt_dir: "checkpoints/hdn_josephfbp_mse"
+  epochs_per_group: 2
+  ckpt_dir: "results/ckpt"
   compile: false
-  flush_every: 10
+  flush_every: 1
   empty_cache_every: 100

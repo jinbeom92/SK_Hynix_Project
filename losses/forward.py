@@ -8,15 +8,6 @@ __all__ = [
 ]
 
 def _to_b1xyz(img: torch.Tensor) -> torch.Tensor:
-    """
-    Canonicalize input to [B, 1, X, Y, Z] without permuting axes.
-
-    Accepted shapes
-    ---------------
-    - [B, X, Y, Z]      → unsqueeze channel → [B, 1, X, Y, Z]
-    - [B, 1, X, Y, Z]   → returned as-is
-    - [B, 1, X, Y]      → add Z=1          → [B, 1, X, Y, 1]
-    """
     if img.dim() == 5:
         B, C, X, Y, Z = img.shape
         if C != 1:
@@ -35,15 +26,6 @@ def _to_b1xyz(img: torch.Tensor) -> torch.Tensor:
 
 
 def radon_forward_slice(img: torch.Tensor, angles: torch.Tensor) -> torch.Tensor:
-    """
-    Parallel-beam Radon transform of an entire **(x,y,z)** volume into a
-    **(x,a,z)** sinogram, computed slice-by-slice along z.
-
-    Coordinate policy
-    -----------------
-    Uses `align_corners=True` in both `affine_grid` and `grid_sample` to match
-    the Joseph projector's sampling convention (adjoint consistency).
-    """
     # Canonicalize to [B,1,X,Y,Z]
     img = _to_b1xyz(img)
     device, dtype = img.device, img.dtype
@@ -86,12 +68,6 @@ def forward_consistency_loss(
     gt_slice: torch.Tensor,
     angles: torch.Tensor,
 ) -> torch.Tensor:
-    """
-    MSE between sinograms of predicted vs. ground-truth volumes.
-
-    Inputs accept ``[B,X,Y,Z]``, ``[B,1,X,Y,Z]`` or 2D slices ``[B,1,X,Y]``.
-    Returns a scalar loss over **[B, X, A, Z]**.
-    """
     sino_pred = radon_forward_slice(pred_slice, angles)  # [B, X, A, Z]
     sino_gt   = radon_forward_slice(gt_slice, angles)    # [B, X, A, Z]
     return F.mse_loss(sino_pred, sino_gt)

@@ -1,24 +1,3 @@
-"""
-Train HDN with **masked MSE only** and **unfiltered backprojection**.
-
-Pipeline (slice training with Z=1)
-----------------------------------
-Sino(x,a,z) → Enc1(A) + Enc2(XA) → Sino2XYAlign(XA→XY) → (optional) VoxelCheat2D →
-Fusion2D(XY) → SinoDecoder2D(XY→XA) → JosephProjector3D.backproject (unfiltered) →
-Recon(x,y,z) → ExpandMaskedMSE(pred=Recon2D, soft-boundary mask/targets from GT2D)
-
-Axis convention (model-facing, fixed)
--------------------------------------
-• Sinogram : (x, a, z) → [B, 1, X, A, Z]
-• Volume   : (x, y, z) → [B, 1, X, Y, Z]
-
-Notes
------
-• Backprojection is **unfiltered by implementation** in `physics/projector.py`.
-• Training loss is **ExpandMaskedMSE** only (in-part + near-boundary out-of-part
-  with soft labels in [boundary_low, boundary_high]), averaged over the masked pixels.
-"""
-
 from pathlib import Path
 import math
 import gc
@@ -41,38 +20,10 @@ from losses.expand_mask_mse import ExpandMaskedMSE
 
 
 def _as_float(x):
-    """
-    Convert a scalar (Python number or 0-d torch.Tensor) to float safely.
-
-    Parameters
-    ----------
-    x : Union[float, int, torch.Tensor]
-
-    Returns
-    -------
-    float
-    """
     return float(x) if not torch.is_tensor(x) else float(x.detach().item())
 
 
 def _init_amp(device: torch.device, cfg: dict):
-    """
-    Decide AMP dtype and scaler based on config and hardware.
-
-    Parameters
-    ----------
-    device : torch.device
-    cfg : dict
-
-    Returns
-    -------
-    enabled : bool
-        Whether autocast/GradScaler should be enabled.
-    amp_dtype : torch.dtype
-        Preferred compute dtype for autocast.
-    scaler : torch.amp.GradScaler
-        Gradient scaler (no-op if disabled).
-    """
     want = (cfg["train"].get("amp_dtype", "auto") or "auto").lower()
     if want == "bf16":
         amp_dtype = torch.bfloat16
@@ -92,14 +43,6 @@ def evaluate_group_by_volume_mse(
     device: torch.device,
     criterion: torch.nn.Module,
 ) -> float:
-    """
-    Volumetric evaluation by **masked MSE only** (slice-wise → per-volume mean → mean over files).
-
-    For each file pair in the dataset:
-      • Iterate depth d = 0..D-1 and run slice inference with Z=1 (cheat OFF).
-      • Compute `criterion(recon2d, gt2d)` per slice and average over depth.
-    Returns the mean masked MSE across files.
-    """
     model.eval()
     loss_sum = 0.0
     file_cnt = 0
@@ -127,15 +70,6 @@ def evaluate_group_by_volume_mse(
 
 
 def main(cfg_path: str):
-    """
-    Train loop: masked-MSE-only slice training with unfiltered BP.
-
-    Shapes (fixed)
-    --------------
-    • Input sino  : [B,1,X,A,1]
-    • GT voxel    : [B,1,X,Y,1]
-    • Recon out   : [B,1,X,Y,1]
-    """
     # --- Config / device / seed ------------------------------------------------------------
     cfg = load_config(cfg_path)
     save_effective_config(cfg, Path(cfg_path).with_name("effective_config.json"))

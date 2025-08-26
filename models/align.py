@@ -5,58 +5,11 @@ import torch.nn.functional as F
 
 
 def _gn(out_ch: int, prefer: int = 8) -> int:
-    """
-    Compute a suitable GroupNorm divisor.
-
-    Args:
-        out_ch (int): number of channels
-        prefer (int): preferred group count (default 8)
-
-    Returns:
-        int: number of groups for GroupNorm such that
-             • divides out_ch evenly (via gcd)
-             • clamped between 1 and out_ch
-    """
     g = math.gcd(out_ch, prefer)
     return max(1, min(out_ch, g if g > 0 else 1))
 
 
 class Sino2XYAlign(nn.Module):
-    """
-    Align sinogram features **(x,a,z)** to voxel-plane features **(x,y,z)**.
-
-    Purpose
-    -------
-    • Consumes concatenated sinogram features from Enc1/Enc2 laid out as (x,a,z).
-    • Applies Conv2D+GroupNorm+ReLU on the (X,A) plane for each z-slice.
-    • Deterministically resizes (X,A) → (X,Y) to match voxel plane size.
-    • Outputs per-slice aligned features with channel width `out_ch`.
-
-    Args
-    ----
-    in_ch : int
-        Number of input feature channels (after fusion).
-    out_ch : int, optional
-        Channel width for each conv block (default: 64).
-    depth : int, optional
-        Number of conv blocks before projection (default: 2).
-    mode : str, optional
-        Interpolation mode for resize: {"bilinear","bicubic","nearest"}.
-
-    Shapes
-    ------
-    Input:
-        F_sino : [B, in_ch, X, A, Z]   or  [B, in_ch, X, A] (treated as Z=1)
-        out_hw : (X, Y)   target voxel-plane size
-    Output:
-        Tensor  : [B, out_ch, X, Y, Z]
-
-    Notes
-    -----
-    • This is a deterministic alignment (resize) on (X,A) — **not** a BP operator.
-    • Implementation flattens (B,Z) → batch to process all slices efficiently.
-    """
-
     def __init__(self, in_ch: int, out_ch: int = 64, depth: int = 2, mode: str = "bilinear"):
         super().__init__()
         self.mode = str(mode)
@@ -72,23 +25,6 @@ class Sino2XYAlign(nn.Module):
         self.out_proj = nn.Identity()  # placeholder if you want a final 1x1 later
 
     def forward(self, F_sino: torch.Tensor, out_hw):
-        """
-        Forward pass.
-
-        Args
-        ----
-        F_sino : Tensor
-            Sinogram feature map in (x,a,z) layout:
-            - [B, in_ch, X, A, Z]  (preferred), or
-            - [B, in_ch, X, A]     (treated as Z=1).
-        out_hw : tuple
-            (X, Y) target spatial size on the voxel plane.
-
-        Returns
-        -------
-        Tensor
-            Aligned voxel-plane feature map with shape [B, out_ch, X, Y, Z].
-        """
         if F_sino.dim() == 5:
             B, C, X, A, Z = F_sino.shape
             # [B,C,X,A,Z] → [B,Z,C,X,A] → [B*Z,C,X,A]

@@ -1,63 +1,24 @@
-"""
-3D projectors with model-facing I/O and **unfiltered** slice-wise backprojection.
-
-Layout (fixed, model-facing)
-----------------------------
-• Volume   (x, y, z) → [B, C, X, Y, Z]
-• Sinogram (x, a, z) → [B, C, X, A, Z]
-
-What's in here
---------------
-• BaseProjector3D        : abstract API (forward/backproject + geometry reset)
-• JosephProjector3D      : Joseph forward (voxel-driven) + **unfiltered** 2D BP per z-slice
-• SiddonProjector3D      : reference Siddon forward/backward (unchanged)
-• make_projector(...)    : factory
-
-Notes
------
-• Compared to the previous implementation, **all Fourier filters are removed**.
-  Backprojection now does **pure angular accumulation** (no ramp / no window).
-• `backproject()` is differentiable (no @torch.no_grad), so gradients flow
-  through the BP path into the sinogram decoder during training.
-"""
-
 from typing import Optional, Literal
 import torch
 import torch.nn.functional as F
-from .geometry import Parallel3DGeometry  # model-facing geometry helpers
+from .geometry import Parallel3DGeometry
 
 
 # ------------------------------------------------------------------------------------------
 # Base
 # ------------------------------------------------------------------------------------------
 class BaseProjector3D(torch.nn.Module):
-    """
-    Abstract base for 3D projectors with model-facing I/O.
-
-    Axis convention (model-facing)
-    ------------------------------
-    * Volume   : [B, C, X, Y, Z]  (x,y,z)
-    * Sinogram : [B, C, X, A, Z]  (x,a,z)
-
-    Implementations may internally permute layouts, but the public API must match.
-    """
-
     def __init__(self, geom: Parallel3DGeometry):
         super().__init__()
         self.geom = geom
 
     def reset_geometry(self, geom: Parallel3DGeometry):
-        """
-        Update all geometry-dependent cached buffers (angles, trig tables, detector coords, etc.).
-        """
         raise NotImplementedError
 
     def forward(self, vol: torch.Tensor) -> torch.Tensor:
-        """Volume → Sinogram. Return [B, C, X, A, Z]."""
         raise NotImplementedError
 
     def backproject(self, sino: torch.Tensor) -> torch.Tensor:
-        """Sinogram → Volume. Return [B, C, X, Y, Z]."""
         raise NotImplementedError
 
 
@@ -65,17 +26,6 @@ class BaseProjector3D(torch.nn.Module):
 # Joseph (voxel-driven) + Unfiltered BP
 # ------------------------------------------------------------------------------------------
 class JosephProjector3D(BaseProjector3D):
-    """
-    Joseph 3D projector (voxel-driven sampled integration for forward; unfiltered BP for back).
-
-    Backprojection path
-    -------------------
-    • Slice-wise 2D backprojection per z, compatible with scikit-image `iradon` geometry,
-      but with **no frequency-domain filtering** (unfiltered BP).
-    • Output normalization uses the standard π/(2A) scale, and an optional circular
-      support mask on (X,Y) for consistency with common CT conventions.
-    """
-
     def __init__(self, geom: Parallel3DGeometry, n_steps: Optional[int] = None):
         super().__init__(geom)
 
@@ -111,9 +61,6 @@ class JosephProjector3D(BaseProjector3D):
 
     @torch.no_grad()
     def reset_geometry(self, geom: Parallel3DGeometry):
-        """
-        Refresh buffers when geometry changes (angles, detector coords, step sizes).
-        """
         self.geom = geom
         new_angles = geom.angles.detach().to(self.angles.device, dtype=self.angles.dtype)
         self.angles.resize_(new_angles.shape).copy_(new_angles)
@@ -141,19 +88,6 @@ class JosephProjector3D(BaseProjector3D):
     # Joseph forward (unchanged)
     # -----------------------------------
     def forward(self, vol: torch.Tensor) -> torch.Tensor:
-        """
-        Volume → Sinogram (Joseph forward), model-facing I/O.
-
-        Parameters
-        ----------
-        vol : Tensor
-            [B, C, X, Y, Z] volume (x,y,z).
-
-        Returns
-        -------
-        Tensor
-            [B, C, X, A, Z] sinogram (x,a,z).
-        """
         # [B,C,X,Y,Z] → internal [B,C,D,H,W]
         vol = vol.permute(0, 1, 4, 3, 2).contiguous()
         B, C, D, H, W = vol.shape
@@ -232,15 +166,10 @@ class JosephProjector3D(BaseProjector3D):
     # -----------------------------------
     @staticmethod
     def _next_pow2(n: int) -> int:
-        """Return max(64, next power-of-two >= 2*n) — kept for parity, not required here."""
         return max(64, 1 << ((2 * n - 1).bit_length()))
 
     @staticmethod
     def _sinogram_circle_to_square_torch(sino: torch.Tensor) -> torch.Tensor:
-        """
-        Pad rows so that an inscribed circle becomes a square support (skimage-style).
-        Input: [N, A] with N detector bins.
-        """
         import math
         N, A = sino.shape
         diagonal = int(math.ceil(math.sqrt(2.0) * N))
@@ -252,7 +181,6 @@ class JosephProjector3D(BaseProjector3D):
 
     @staticmethod
     def _interp1d_linear_torch(col: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
-        """1D linear interpolation with zero outside, x = arange(N) - N//2."""
         N = col.shape[0]
         center = N // 2
         idx = t + center
@@ -266,7 +194,6 @@ class JosephProjector3D(BaseProjector3D):
 
     @staticmethod
     def _interp1d_nearest_torch(col: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
-        """1D nearest interpolation with zero outside, x = arange(N) - N//2."""
         N = col.shape[0]
         center = N // 2
         idx = torch.round(t + center).to(torch.long)
@@ -283,27 +210,7 @@ class JosephProjector3D(BaseProjector3D):
         interpolation: str = "linear",
         circle: bool = True,
     ) -> torch.Tensor:
-        """
-        2D **unfiltered** backprojection compatible with scikit-image `iradon` geometry.
 
-        Inputs
-        ------
-        radon_image : [N, A]
-            N detector bins by A angles.
-        theta_deg   : [A]
-            Angles in degrees.
-        output_size : int
-            Reconstructed side length (Y-axis in model coords).
-        interpolation : {"linear","nearest"}
-            1D interpolation along detector coordinate during angular accumulation.
-        circle : bool
-            If True, mask final grid outside the inscribed circle.
-
-        Returns
-        -------
-        Tensor
-            Reconstructed square image [output_size, output_size] (Y×Y).
-        """
         if radon_image.ndim != 2:
             raise ValueError("radon_image must be [N, A].")
         if theta_deg.ndim != 1 or theta_deg.numel() != radon_image.shape[1]:
@@ -320,7 +227,6 @@ class JosephProjector3D(BaseProjector3D):
             sino = JosephProjector3D._sinogram_circle_to_square_torch(sino)
             N = sino.shape[0]
 
-        # 누적 버퍼/좌표는 float32
         recon = torch.zeros((output_size, output_size), device=device, dtype=dtype_acc)
         radius = output_size // 2
         yy, xx = torch.meshgrid(
@@ -354,14 +260,6 @@ class JosephProjector3D(BaseProjector3D):
 
     # Differentiable BP
     def backproject(self, sino: torch.Tensor) -> torch.Tensor:
-        """
-        Sinogram → Volume via **unfiltered** slice-wise backprojection.
-
-        I/O (model-facing)
-        ------------------
-        sino : [B, C, X, A, Z]  (x,a,z)
-        return: [B, C, X, Y, Z] (x,y,z)
-        """
         if sino.ndim != 5:
             raise ValueError(f"Expected [B,C,X,A,Z], got {tuple(sino.shape)}")
         B, C, X, A, Z = sino.shape
@@ -414,63 +312,10 @@ class JosephProjector3D(BaseProjector3D):
 
 
 # ------------------------------------------------------------------------------------------
-# Siddon (reference; unchanged)
-# ------------------------------------------------------------------------------------------
-class SiddonProjector3D(BaseProjector3D):
-    """
-    Siddon 3D projector (ray-driven, analytical voxel intersection lengths).
-    Kept unchanged as a reference implementation.
-    """
-
-    def __init__(self, geom: Parallel3DGeometry):
-        super().__init__(geom)
-        self.register_buffer("angles", geom.angles.clone().detach())
-
-        # Detector coordinates centered at 0
-        V, U = geom.V, geom.U
-        sv, su = geom.det_spacing
-        v = (torch.arange(V, dtype=torch.float32) - (V - 1) / 2.0) * sv
-        u = (torch.arange(U, dtype=torch.float32) - (U - 1) / 2.0) * su
-        self.register_buffer("u_phys", u)
-        self.register_buffer("v_phys", v)
-
-        # Voxel spacing
-        sd, sy, sx = geom.voxel_size
-        self.sx = float(sx); self.sy = float(sy); self.sd = float(sd)
-
-    @torch.no_grad()
-    def reset_geometry(self, geom: Parallel3DGeometry):
-        """Update cached geometry-dependent buffers (angles, detector coordinates, spacings)."""
-        self.geom = geom
-        new_angles = geom.angles.detach().to(self.angles.device, dtype=self.angles.dtype)
-        self.angles.resize_(new_angles.shape).copy_(new_angles)
-
-        V, U = geom.V, geom.U
-        sv, su = geom.det_spacing
-        v = (torch.arange(V, dtype=torch.float32, device=self.angles.device) - (V - 1) / 2.0) * sv
-        u = (torch.arange(U, dtype=torch.float32, device=self.angles.device) - (U - 1) / 2.0) * su
-        if hasattr(self, "u_phys"): self.u_phys.resize_(u.shape).copy_(u)
-        else: self.register_buffer("u_phys", u)
-        if hasattr(self, "v_phys"): self.v_phys.resize_(v.shape).copy_(v)
-        else: self.register_buffer("v_phys", v)
-
-        sd, sy, sx = geom.voxel_size
-        self.sx = float(sx); self.sy = float(sy); self.sd = float(sd)
-
-    # (forward/backproject identical to previous implementation)
-    # ... (omitted here for brevity; keep Siddon forward/back exactly as before) ...
-
-
-# ------------------------------------------------------------------------------------------
 # Factory
 # ------------------------------------------------------------------------------------------
 def make_projector(method: Literal["joseph3d", "siddon3d"], geom: Parallel3DGeometry) -> BaseProjector3D:
-    """
-    Factory for 3D projectors with model-facing I/O.
-    """
     if method == "joseph3d":
         return JosephProjector3D(geom, n_steps=geom.n_steps_cap)
-    elif method == "siddon3d":
-        return SiddonProjector3D(geom)
     else:
         raise ValueError(f"Unknown projector method: {method}")

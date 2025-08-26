@@ -4,12 +4,6 @@ from utils.metrics import psnr, band_penalty, energy_penalty, voxel_error_rate, 
 from utils.ssim3d import ssim3d
 
 def _to_b1xyz(x: torch.Tensor) -> torch.Tensor:
-    """
-    Canonicalize a volume to channel-first **[B, 1, X, Y, Z]** without
-    changing axis order (x,y,z). Accepted shapes:
-      - [B, 1, X, Y, Z] → returned as-is
-      - [B, X, Y, Z]    → unsqueeze channel → [B, 1, X, Y, Z]
-    """
     if x.ndim == 5:
         if x.shape[1] != 1:
             raise ValueError(f"Expected channel dimension C=1, got shape {tuple(x.shape)}.")
@@ -20,19 +14,6 @@ def _to_b1xyz(x: torch.Tensor) -> torch.Tensor:
 
 
 def _ssim_safe(R_xyz: torch.Tensor, V_xyz: torch.Tensor) -> torch.Tensor:
-    """
-    SSIM-based loss aligned to **(x,y,z)** volumes.
-
-    - If Z==1 → approximate with 2D SSIM on the single slice [B,1,X,Y].
-    - Else    → call `ssim3d` on [B,1,Z,X,Y] (permute only for SSIM).
-
-    Returns
-    -------
-    Tensor
-        Loss tensor shaped like [B,1,1,1,1] (kept dims for easy broadcasting).
-        Convention: **1 - SSIM** for 2D path, while `ssim3d` is assumed to
-        already return the SSIM-style loss as in the previous setup.
-    """
     R = _to_b1xyz(R_xyz)  # [B,1,X,Y,Z]
     V = _to_b1xyz(V_xyz)
     Z = R.shape[-1]
@@ -67,23 +48,6 @@ def _ssim_safe(R_xyz: torch.Tensor, V_xyz: torch.Tensor) -> torch.Tensor:
 
 
 def tv_isotropic_3d(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
-    """
-    Isotropic total variation on **(x,y,z)** volumes.
-
-    Input
-    -----
-    x : Tensor
-        Volume in shape **[B, 1, X, Y, Z]** (use `_to_b1xyz` before calling).
-
-    Implementation detail
-    ---------------------
-    Use forward differences and compute TV on the common cropped region
-    so that the three directional gradients share the same shape:
-        common = x[:, :, 1:, 1:, 1:]  → [B,1,X-1,Y-1,Z-1]
-        dx = common - x[:, :, :-1, 1:, 1:]
-        dy = common - x[:, :, 1:, :-1, 1:]
-        dz = common - x[:, :, 1:, 1:, :-1]
-    """
     if x.ndim != 5 or x.shape[1] != 1:
         raise ValueError("tv_isotropic_3d expects [B,1,X,Y,Z].")
 
@@ -100,41 +64,6 @@ def reconstruction_losses(R_hat_n: torch.Tensor,
                           V_gt_n: torch.Tensor,
                           weights: dict,
                           params: dict):
-    """
-    Aggregate reconstruction-domain losses for **(x,y,z)** volumes.
-
-    Inputs
-    ------
-    R_hat_n : Tensor
-        Predicted volume, shape **[B, X, Y, Z]** or **[B, 1, X, Y, Z]**.
-    V_gt_n : Tensor
-        Ground-truth volume, same shape conventions as `R_hat_n`.
-    weights : dict
-        Loss weights, e.g. {"ssim": a, "psnr": b, "band": c, ...}.
-        If key == "psnr", we use **psnr_loss** (normalized) instead of raw PSNR.
-    params : dict
-        Hyper-parameters, must include:
-          - "band_low", "band_high"
-          - "ver_thr"
-          - optional "psnr_ref" (default 40.0)
-          - optional "tv_weight" (default 0.0)
-
-    Returns
-    -------
-    dict
-        {
-          "ssim":        ...,
-          "psnr":        ...,
-          "psnr_loss":   ...,
-          "band":        ...,
-          "energy":      ...,
-          "ver":         ...,
-          "ipdr":        ...,
-          "tv":          ...,
-          "total_recon": ...
-        }
-        Scalar-like tensors are kept broadcastable with shape [B,1,1,1,1].
-    """
     loss_dict = {}
 
     # Canonicalize to [B,1,X,Y,Z] (no axis permutation)
