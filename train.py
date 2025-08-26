@@ -1,4 +1,3 @@
-# train.py
 """
 Train HDN with **masked MSE only** and **unfiltered backprojection**.
 

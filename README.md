@@ -171,83 +171,39 @@ python -m train --cfg config.yaml
 ## Architecture Diagram
 
 ```text
-Inputs & Conventions
-──────────────────────────────────────────────────────────────────────────────
-Sinogram (x,a,z): [B,1,X,A,Z]          Volume (x,y,z): [B,1,X,Y,Z]
-
-Pipeline (Training mode; Z=1 per minibatch slice)
-──────────────────────────────────────────────────────────────────────────────
-                ┌────────────────────────────────────────────────┐
-                │            Input Sinogram S[x,a,z]             │
-                │                 [B,1,X,A,Z]                    │
-                └───────────────┬────────────────────────────────┘
-                                │
-                ┌───────────────┴───────────────┐
-                │                               │
-        ┌───────▼───────┐               ┌───────▼───────┐
-        │ Enc1_1D_Angle │               │ Enc2_2D_Sino │
-        │ 1D over A     │               │ 2D over X×A  │
-        │[B,C1,X,A,Z]   │               │[B,C2,X,A,Z]  │
-        └───────┬───────┘               └───────┬───────┘
-                │               Concatenate     │
-                └───────────────┬───────────────┘
-                                ▼
-                       Sino2XYAlign (XA→XY)
-                         [B,Ca,X,Y,Z]
-                                │
-                ┌───────────────┴───────────────┐
-                │                               │
-        (train only)                          (eval)
-        ┌───────────────┐                    ┌──────┐
-        │ VoxelCheat2D  │  (GT slice)        │ None │
-        │[B,Cc,X,Y,Z]   │                    └──────┘
-        └───────────────┘
-                │
-                ├───────────────┐
-                │               │  (zeros auto‑injected if cheat disabled)
-                ▼               ▼
-                     Concatenate & Mix
-                          Fusion2D
-                        [B,Cf,X,Y,Z]
-                                │
-                                ▼
-                        SinoDecoder2D
-                      (XY→XA, clamp[0,1])
-                         [B,1,X,A,Z]
-                                │
-                                ▼
-          JosephProjector3D.backproject (Unfiltered BP)
-                         [B,1,X,Y,Z]
-                                │
-                                ▼
-      ┌─────────────────────────────────────────────────────┐
-      │  ExpandMaskedMSE (slice‑wise)                       │
-      │  • Mask = in‑part ∪ near‑boundary(out‑of‑part)     │
-      │  • Targets: in‑part=1.0, boundary∈[0.8..0.9]       │
-      │  • Far background = excluded from loss              │
-      └─────────────────────────────────────────────────────┘
-
-
-Inference (Evaluation / Full Volume)
-──────────────────────────────────────────────────────────────────────────────
-For each file pair:
-  for z = 0..D-1:
-    S[...,z] → Encoders → Align → Fusion (no cheat) → SinoDecoder2D
-             → Unfiltered BP → Recon[...,z]
-  Stack along z → Recon volume [X,Y,D]
-
-
-Shapes per Stage (Z=1 minibatch)
-──────────────────────────────────────────────────────────────────────────────
-Sino in          : [B,1,X,A,1]
-Enc1 out         : [B,C1,X,A,1]
-Enc2 out         : [B,C2,X,A,1]
-Aligned (XY)     : [B,Ca,X,Y,1]
-Cheat (optional) : [B,Cc,X,Y,1]
-Fused (XY)       : [B,Cf,X,Y,1]
-Sino decoded     : [B,1,X,A,1]
-Recon (BP)       : [B,1,X,Y,1]
-Loss slice input : pred/gt → [B,1,X,Y]
+            Input Sinogram [B,1,X,A,Z]
+                        │
+        ┌───────────────┴───────────────┐
+        ▼                               ▼
+  Enc1_1D_Angle                   Enc2_2D_Sino
+ [B,C1,X,A,Z]                     [B,C2,X,A,Z]
+        └───────────────┬───────────────┘
+                        ▼
+                  Concatenate → [B,C1+C2,X,A,Z]
+                        │
+                        ▼
+               Sino2XYAlign (XA→XY)
+               [B,Ca,X,Y,Z]
+                        │
+        ┌───────────────┴───────────────┐
+        ▼                               ▼
+   VoxelCheat2D (train)              None (eval)
+   [B,Cc,X,Y,Z]                           
+        └───────────────┬───────────────┘
+                        ▼
+                     Fusion2D
+                  [B,Cf,X,Y,Z]
+                        │
+                        ▼
+                 SinoDecoder2D
+              [B,1,X,A,Z] (predicted)
+                        │
+                        ▼
+         JosephProjector3D.backproject
+          (Unfiltered BP, slice-wise)
+                        │
+                        ▼
+              Recon Volume [B,1,X,Y,Z]
 ```
 
 Loss:
