@@ -309,38 +309,36 @@ class JosephProjector3D(BaseProjector3D):
         if theta_deg.ndim != 1 or theta_deg.numel() != radon_image.shape[1]:
             raise ValueError("theta length must match number of projection columns.")
 
-        device, dtype = radon_image.device, radon_image.dtype
-        N, A = radon_image.shape
+        import math
+        device = radon_image.device
+        dtype_in = radon_image.dtype
+        dtype_acc = torch.float32
 
-        # Optional circle→square padding (skimage style)
+        N, A = radon_image.shape
         sino = radon_image
         if circle:
             sino = JosephProjector3D._sinogram_circle_to_square_torch(sino)
             N = sino.shape[0]
 
-        # No FFT/filtering → use sinogram as-is
-        radon_filtered = sino  # [N, A]
-
-        # Allocate output grid
-        recon = torch.zeros((output_size, output_size), device=device, dtype=dtype)
+        # 누적 버퍼/좌표는 float32
+        recon = torch.zeros((output_size, output_size), device=device, dtype=dtype_acc)
         radius = output_size // 2
         yy, xx = torch.meshgrid(
-            torch.arange(output_size, device=device, dtype=dtype),
-            torch.arange(output_size, device=device, dtype=dtype),
+            torch.arange(output_size, device=device, dtype=dtype_acc),
+            torch.arange(output_size, device=device, dtype=dtype_acc),
             indexing="ij",
         )
         ypr = yy - radius
         xpr = xx - radius
 
-        theta_rad = torch.deg2rad(theta_deg.to(dtype))
+        theta_rad = torch.deg2rad(theta_deg.to(dtype_acc))
         cos_t, sin_t = torch.cos(theta_rad), torch.sin(theta_rad)
 
         if interpolation not in ("linear", "nearest"):
             raise ValueError("interpolation must be 'linear' or 'nearest'.")
 
-        # Angular accumulation
         for i in range(A):
-            col = radon_filtered[:, i]  # [N]
+            col = sino[:, i].to(dtype_acc)
             t = ypr * cos_t[i] - xpr * sin_t[i]
             if interpolation == "linear":
                 recon += JosephProjector3D._interp1d_linear_torch(col, t)
@@ -349,12 +347,10 @@ class JosephProjector3D(BaseProjector3D):
 
         if circle:
             mask = (xpr**2 + ypr**2) > (radius**2)
-            recon = torch.where(mask, torch.zeros((), dtype=dtype, device=device), recon)
+            recon = torch.where(mask, torch.zeros((), dtype=dtype_acc, device=device), recon)
 
-        # Scale identical to skimage for comparability
-        import math
         recon = recon * (math.pi / (2.0 * A))
-        return recon
+        return recon.to(dtype_in)
 
     # Differentiable BP
     def backproject(self, sino: torch.Tensor) -> torch.Tensor:
@@ -388,8 +384,18 @@ class JosephProjector3D(BaseProjector3D):
                         s_2d, theta_deg, output_size=Y,
                         interpolation=self.ir_interpolation, circle=self.ir_circle
                     )  # [Y, Y]
-                    rec_xy = rec_y_y.t()  # [X, Y] (model-facing transpose)
-                    rec_slices.append(rec_xy.unsqueeze(-1))  # [X, Y, 1]
+
+                    # shape == [X, Y]
+                    if X != Y:
+                        # [Y,Y] → [Y,X] resize → [X,Y]
+                        rec_yx = F.interpolate(
+                            rec_y_y.unsqueeze(0).unsqueeze(0),  # [1,1,Y,Y]
+                            size=(Y, X), mode="bilinear", align_corners=False
+                        )[0, 0]                                  # [Y,X]
+                        rec_xy = rec_yx.t()                      # [X,Y]
+                    else:
+                        rec_xy = rec_y_y.t()                     # [Y,Y] == [X,Y]
+                    rec_slices.append(rec_xy.unsqueeze(-1))      # [X, Y, 1]
                 out_c = torch.cat(rec_slices, dim=-1)       # [X, Y, Z]
                 outs_C.append(out_c.unsqueeze(0))           # [1, X, Y, Z]
             out_b = torch.cat(outs_C, dim=0)                # [C, X, Y, Z]
