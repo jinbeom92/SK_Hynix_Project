@@ -1,61 +1,66 @@
-# ==============================================================================
-# HDN (Enc1+Enc2 → Align → Fusion → SinoDecoder → Unfiltered BP) — Training Config
-#
-# Overview
-# --------
-# • Data: Paired sinogram/voxel files. The dataset expects sinograms in [U(=X), A, D]
-#   and voxels in [X, Y, D]. Each training sample is a single z-slice.
-# • Geometry: Parallel-beam 3D geometry defined in model-facing coords (X,Y,Z) and
-#   detector (X,Z). Angles are inferred per group from data (0..π, A samples).
-# • Model: Sinogram encoders (1D over A, 2D over X×A), alignment to XY, optional
-#   cheat features from GT voxels (training only), fusion on XY, then a decoder
-#   mapping XY→XA to produce an optimized sinogram; backprojection is unfiltered.
-# • Loss: ExpandMaskedMSE only. It trains on in-part + near-boundary out-of-part
-#   pixels, with soft boundary targets and all far out-of-part masked out.
-# • Train loop: Slice-wise training with AMP, gradient clipping, CSV logging, and
-#   group-wise evaluation by stacking slice reconstructions into volumes.
-#
-# Notes
-# -----
-# • All tensors obey the fixed axis convention:
-#       Sinogram (x,a,z) → [B, 1, X, A, Z]
-#       Volume   (x,y,z) → [B, 1, X, Y, Z]
-# • Backprojection uses a differentiable, unfiltered angular accumulation
-#   (no frequency-domain filter), with optional circular support masking.
-# ==============================================================================
+# config.yaml
 
+# -----------------------------
+# Data (paths & file patterns)
+# -----------------------------
 data:
-  root: dataset
-  sino_glob: "sino_gt/*_sino.npy"
-  voxel_glob: "voxel_gt/*_voxel.npy"
+  root: "dataset"                  # dataset root folder
+  sino_glob: "sino/*_sino.npy"     # sinograms inside dataset/sino
+  voxel_glob: "voxel/*_voxel.npy"  # voxels   inside dataset/voxel
 
-projector:
-  method: "joseph3d"
-
+# -----------------------------
+# Geometry / projector
+# -----------------------------
 geom:
   voxel_size_xyz: [1.0, 1.0, 1.0]
   det_spacing_xz: [1.0, 1.0]
   angle_chunk: 16
   n_steps_cap: 256
 
+projector:
+  method: "joseph3d"               # physics BP (unfiltered)
+
+# -----------------------------
+# Model
+# -----------------------------
 model:
-  enc1:   { base: 32, depth: 3 }
-  enc2:   { base: 32, depth: 3 }
-  align:  { out_ch: 64, depth: 2, interp_mode: "bilinear" }
+  # encoders
+  enc1: { base: 32, depth: 3 }
+  enc2: { base: 32, depth: 3 }
+
+  # XA→XY align
+  align: { out_ch: 64, depth: 2, interp_mode: "bilinear" }
+
+  # optional GT-cheat path (train only; ignored at inference)
   cheat2d: { enabled: true, base: 16, depth: 2 }
+
+  # XY fusion
   fusion: { out_ch: 64 }
-  sino_dec: { mid_ch: 64, depth: 2, interp_mode: "bilinear" }
-  clamp_recon: true
 
-losses:
-  expand_thr: 0.8
-  expand_spacing: null
-  expand_include_in: true
-  expand_in_value: 1.0
-  expand_boundary_low: 0.8
-  expand_boundary_high: 0.9
-  expand_clamp: false
+  # XY→XA sino decoder (stack strictly along A)
+  sino_dec:
+    mid_ch: 64
+    depth: 2
+    interp_mode: "bilinear"
+    bound: "none"                  # {"none","clamp","sigmoid"}
+    prefer_gn: 8
+    antialias: null                # null→auto when downsampling
 
+  clamp_recon: true                # clamp final recon to [0,1]
+  strict_geometry: false
+
+# -----------------------------
+# PSF (disabled — not used in training)
+# -----------------------------
+psf:
+  enabled: false
+  angle_variant: false
+  sigma_u: 0.7
+  sigma_v: 0.7
+
+# -----------------------------
+# Training (used by train.py)
+# -----------------------------
 train:
   seed: 1337
   amp: true
@@ -75,3 +80,21 @@ train:
   compile: false
   flush_every: 1
   empty_cache_every: 100
+
+# -----------------------------
+# Losses (masked MSE config)
+# -----------------------------
+losses:
+  expand_thr: 0.8
+  expand_spacing: null
+  expand_include_in: true
+  expand_in_value: 1.0
+  expand_boundary_low: 0.8
+  expand_boundary_high: 0.9
+  expand_clamp: false
+
+# -----------------------------
+# Debug
+# -----------------------------
+debug:
+  az_sanity_check: false
