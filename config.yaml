@@ -1,100 +1,93 @@
-# config.yaml
+# ==============================================================================
+# HDN (Enc1+Enc2 → Align → Fusion → SinoDecoder → Unfiltered BP) — Training Config
+#
+# refs: Sino2XYAlign, DecoderSlice2D, Enc1_1D_Angle  :contentReference[oaicite:0]{index=0} :contentReference[oaicite:1]{index=1} :contentReference[oaicite:2]{index=2}
+#
+# Axes convention
+#  - Sinogram (x,a,z) → [B, 1, X, A, Z]
+#  - Volume   (x,y,z) → [B, 1, X, Y, Z]
+# Backprojection: differentiable, unfiltered; circular XY support; scale by θ_span/(2·A_eff).
+# ==============================================================================
 
-# -----------------------------
-# Data (paths & file patterns)
-# -----------------------------
 data:
-  root: "dataset"                  # dataset root folder
-  sino_glob: "sino/*_sino.npy"     # sinograms inside dataset/sino
-  voxel_glob: "voxel/*_voxel.npy"  # voxels   inside dataset/voxel
-
-# -----------------------------
-# Geometry / projector
-# -----------------------------
-geom:
-  voxel_size_xyz: [1.0, 1.0, 1.0]
-  det_spacing_xz: [1.0, 1.0]
-  angle_chunk: 16
-  n_steps_cap: 256
+  root: dataset
+  sino_glob: "sino/*_sino.npy"     # sinograms  [X, A, Z]
+  voxel_glob: "voxel/*_voxel.npy"  # voxels     [X, Y, Z]
 
 projector:
-  method: "joseph3d"               # physics BP (unfiltered)
+  method: "joseph3d"
+  bp_span: "full"        # {"half","full","auto"}; auto: A>=300→full(0..360), else half(0..180)
+  dc_mode: "none"    # {"none","detector","angle","both"}; mean removal for unfiltered BP
+  fbp_filter: "hamming"       # {"none","ramp","shepp-logan","cosine","hann","hamming"}
+  fbp_cutoff: 1.0          # 0.8~1.0
+  fbp_pad_mode: "next_pow2"
 
-# -----------------------------
-# Model
-# -----------------------------
+geom:
+  voxel_size_xyz: [1.0, 1.0, 1.0]  # (sx, sy, sz)
+  det_spacing_xz: [1.0, 1.0]       # (su, sv)
+  angle_chunk: 16                  # chunk size over angles in forward projector
+  n_steps_cap: 256                 # Joseph integration steps along ray
+
 model:
-  # encoders
-  enc1: { base: 32, depth: 3 }
-  enc2: { base: 32, depth: 3 }
+  enc1:   { base: 64, depth: 3 }                     # 1D over angle (A)
+  enc2:   { base: 64, depth: 3 }                     # 2D over (X×A)
+  align:  { out_ch: 64, depth: 2, interp_mode: "bilinear" }  # Sino→XY align (resample to X×Y)
+  cheat2d: { enabled: true, base: 32, depth: 2 }     # (train-only) GT-derived hints
+  fusion: { out_ch: 64 }                              # fuse enc/cheat features on XY
+  sino_dec: { mid_ch: 128, depth: 4, interp_mode: "bilinear", bound: "none" }  # XY→XA
+  clamp_recon: true            # clamp recon to [0,1] before loss/eval (safety)
+  ir_impl: "grid"              # projector BP impl: {"grid","interp"}
+  ir_interpolation: "linear"   # only used if ir_impl=="interp"
+  ir_circle: true              # circular XY mask after BP
+  strict_geometry: false       # leave False for slice-mode training
 
-  # XA→XY align
-  align: { out_ch: 64, depth: 2, interp_mode: "bilinear" }
-
-  # optional GT-cheat path (train only; ignored at inference)
-  cheat2d: { enabled: true, base: 16, depth: 2 }
-
-  # XY fusion
-  fusion: { out_ch: 64 }
-
-  # XY→XA sino decoder (stack strictly along A)
-  sino_dec:
-    mid_ch: 64
-    depth: 2
-    interp_mode: "bilinear"
-    bound: "none"                  # {"none","clamp","sigmoid"}
-    prefer_gn: 8
-    antialias: null                # null→auto when downsampling
-
-  clamp_recon: true                # clamp final recon to [0,1]
-  strict_geometry: false
-
-# -----------------------------
-# PSF (disabled — not used in training)
-# -----------------------------
 psf:
   enabled: false
   angle_variant: false
   sigma_u: 0.7
   sigma_v: 0.7
 
-# -----------------------------
-# Training (used by train.py)
-# -----------------------------
+losses:
+  impl: "near_expand_composite_v2"  # selects NearExpandMaskedCompositeLossV2
+  # Near/expand mask (physical EDT in pixels unless spacing provided)
+  thr: 0.8
+  near_value: 0.8
+  spacing: null                    # e.g., [dy, dx] if anisotropic; else null
+  clamp_pred_gt: true              # clamp pred/gt to [0,1] before loss
+  # Composite terms
+  w_mse: 1.0
+  w_ssim: 0.5
+  w_psnr: 0.0                      # PSNR overlaps MSE; keep 0 unless needed
+  ssim_win_size: 7
+  ssim_sigma: 1.5
+  ssim_grad: true
+  psnr_grad: true
+  psnr_ref: 40.0
+  reduction: "mean"                # {"mean","none"}
+  weighted_mean_by_mask: true
+  eps: 1.0e-8
+  max_val: 1.0                     # dynamic range for PSNR/SSIM constants
+
 train:
   seed: 1337
   amp: true
-  amp_dtype: "auto"
-  optimizer: "adamw"
-  lr: 1.0e-4
-  weight_decay: 1.0e-3
+  amp_dtype: "auto"          # {"bf16","fp16","auto"}
+  optimizer: "adamw"         # {"adamw","adafactor"}
+  lr: 3.0e-4
+  weight_decay: 1.0e-4
   batch_size: 8
   num_workers: 4
   grad_clip: 1.0
   grad_accum_steps: 1
   train_ratio: 0.8
-  files_per_group: 10
+  files_per_group: 1
   epochs: 1
-  epochs_per_group: 2
+  epochs_per_group: 600
   ckpt_dir: "results/ckpt"
   compile: false
-  flush_every: 1
+  flush_every: 10
   empty_cache_every: 100
+  # val_batch_size: 8          # (optional) override; defaults to train batch_size
 
-# -----------------------------
-# Losses (masked MSE config)
-# -----------------------------
-losses:
-  expand_thr: 0.8
-  expand_spacing: null
-  expand_include_in: true
-  expand_in_value: 1.0
-  expand_boundary_low: 0.8
-  expand_boundary_high: 0.9
-  expand_clamp: false
-
-# -----------------------------
-# Debug
-# -----------------------------
 debug:
-  az_sanity_check: false
+  az_sanity_check: true
