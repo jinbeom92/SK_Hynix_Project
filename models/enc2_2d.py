@@ -4,9 +4,11 @@ of 2D convolutions to the sinogram plane (X×A).  Given an input sinogram
 with shape [B,1,X,A,Z], where X is the detector pixel dimension, A is the
 number of projection angles, and Z is the depth (number of slices), it
 flattens the batch and depth dimensions to process each [X,A] slice via
-Conv2D→GroupNorm→ReLU blocks.  The output is reshaped back to
+residual Conv2D→GroupNorm→ReLU blocks.  Each block adds its output to its
+input when the channel and spatial sizes match, promoting the learning of
+corrections rather than full mappings.  The output is reshaped back to
 [B,C_out,X,A,Z] so that downstream modules (e.g., Sino2XYAlign) can fuse it
-with other features.
+with other features:contentReference[oaicite:2]{index=2}.
 
 As with the 1D encoder, this module ensures that inputs of shape
 [B,1,X,A] or [B,X,A,Z] are canonicalised to [B,1,X,A,Z] before processing.
@@ -40,9 +42,26 @@ class Conv2DReLU(nn.Module):
         self.act = nn.ReLU(inplace=True)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.conv(x)
-        x = self.gn(x)
-        return self.act(x)
+        """
+        Apply a 2D convolution followed by group normalisation and ReLU.
+
+        A residual skip connection is applied when the input and output
+        dimensions match exactly (same batch, channel, height and width),
+        allowing the block to learn corrections rather than complete
+        transformations and improving stability in deeper stacks:contentReference[oaicite:3]{index=3}.
+
+        Args:
+            x: Input tensor of shape [N,C_in,H,W].
+
+        Returns:
+            Tensor of shape [N,C_out,H,W] with optional residual addition.
+        """
+        y = self.conv(x)
+        y = self.gn(y)
+        y = self.act(y)
+        if y.shape == x.shape:
+            return y + x
+        return y
 
 
 class Enc2_2D_Sino(nn.Module):

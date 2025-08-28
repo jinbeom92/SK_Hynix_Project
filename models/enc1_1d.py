@@ -3,10 +3,12 @@ This module implements the Enc1 component of HDN, which applies a stack of
 1D convolutions along the projection angle dimension.  The sinogram input
 has shape [B,1,X,A,Z], where X is the detector pixel count, A is the number of
 angles, and Z is the depth.  The encoder flattens the (B,X,Z) dimensions,
-applies Conv1D→GroupNorm→ReLU blocks to each [1,A] signal, and then
+applies residual Conv1D→GroupNorm→ReLU blocks (each block adds its output to
+its input when the channel and length match) to each [1,A] signal, and then
 restores the original ordering, producing a feature tensor of shape
-[B,C_out,X,A,Z].  This captures angular patterns while preserving the spatial
-and depth axes for later modules.
+[B,C_out,X,A,Z].  This residual design encourages the network to learn
+correction terms rather than full mappings, improving gradient flow and
+preserving low‑frequency angular patterns:contentReference[oaicite:0]{index=0}.
 """
 
 from __future__ import annotations
@@ -37,9 +39,27 @@ class Conv1DReLU(nn.Module):
         self.act = nn.ReLU(inplace=True)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.conv(x)
-        x = self.gn(x)
-        return self.act(x)
+        """
+        Apply a 1D convolution followed by group normalisation and ReLU activation.
+
+        A residual skip connection is applied when the input and output shapes
+        match exactly.  This encourages the network to learn residuals of the
+        angular signal rather than the full mapping, improving gradient flow in
+        deep stacks:contentReference[oaicite:1]{index=1}.
+
+        Args:
+            x: Input tensor of shape [N,C_in,L].
+
+        Returns:
+            Tensor of shape [N,C_out,L] with optional residual addition.
+        """
+        y = self.conv(x)
+        y = self.gn(y)
+        y = self.act(y)
+        # If the shapes match exactly, add a skip connection
+        if y.shape == x.shape:
+            return y + x
+        return y
 
 
 class Enc1_1D_Angle(nn.Module):

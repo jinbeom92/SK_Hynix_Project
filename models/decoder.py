@@ -2,18 +2,21 @@
 This module converts XY feature maps back into X×A sinograms. In the HDN
 architecture, after the sinogram features are aligned onto the XY plane and
 optionally fused with cheat features, the resulting tensor has shape
-[B,C,X,Y,Z] where X and Y are spatial dimensions and Z is depth.  SinoDecoder2D
-applies a stack of 2D convolutional layers to refine these features and then
-resizes them from (X,Y) to (X,A) along the second spatial axis.  The predicted
+[B,C,X,Y,Z], where X and Y are spatial dimensions and Z is depth.  The
+`SinoDecoder2D` applies a stack of residual Conv2D→GroupNorm→ReLU layers to
+mix the channels and then resizes the (X,Y) grid to (X,A) along the second
+spatial axis.  A residual skip connection is inserted across the mixing
+stage when the input and output have identical shapes; this encourages the
+decoder to learn only correction terms rather than full mappings, improving
+gradient flow in deeper networks:contentReference[oaicite:4]{index=4}.  The predicted
 sinogram has shape [B,1,X,A,Z] and is optionally passed through a bounding
-function (none/sigmoid/tanh).
+function (``none``, ``sigmoid`` or ``tanh``).
 
-The interpolation of dimension Y→A mirrors the bilinear resampling used in the
-HDN paper and aligns with scikit‑image’s philosophy of continuous Radon
-inversion. Passing the entire volume
-[B,C,X,Y,Z] rather than per‑slice avoids collapsing the Z dimension during this
-interpolation step, ensuring that the decoder stacks along the angle dimension A
-rather than depth Z.
+The interpolation of dimension Y→A mirrors the bilinear resampling used in
+the HDN paper and aligns with scikit‑image’s philosophy of continuous Radon
+inversion. Passing the entire volume [B,C,X,Y,Z] rather than per‑slice avoids
+collapsing the Z dimension during this interpolation step, ensuring that the
+decoder stacks along the angle dimension A rather than depth Z.
 """
 
 from __future__ import annotations
@@ -90,17 +93,17 @@ class SinoDecoder2D(nn.Module):
         return x
 
     def forward(self, F_xy: torch.Tensor, target_A: Optional[int] = None) -> torch.Tensor:
-        """Perform the decoding and angle resizing.
+        """Perform the decoding and angle resizing with a residual skip connection.
 
         Args:
-            F_xy: XY feature tensor [B,C,X,Y,Z] or [B,C,X,Y].
-            target_A: Desired number of projection angles; if None, Y is used.
+            F_xy: XY feature tensor ``[B,C,X,Y,Z]`` or ``[B,C,X,Y]``.
+            target_A: Desired number of projection angles; if ``None``, the input Y dimension is used.
 
         Returns:
-            [B,1,X,A,Z] sinogram tensor.
+            ``[B,1,X,A,Z]`` sinogram tensor.
 
         Raises:
-            ValueError: If the input dimensionality is unsupported or target_A is not positive.
+            ValueError: If the input dimensionality is unsupported or ``target_A`` is not positive.
         """
         # Flatten depth dimension for 2D convolution processing
         if F_xy.dim() == 5:
@@ -114,8 +117,13 @@ class SinoDecoder2D(nn.Module):
             raise ValueError(
                 f"SinoDecoder2D expects [B,C,X,Y,Z] or [B,C,X,Y], got {tuple(F_xy.shape)}"
             )
+        # Save pre-mixing features for a residual connection
+        x0 = x
         # 2D convolutional stack
         x = self.net(x)  # [B*Z, 1, X, Y]
+        # Apply residual skip connection when shapes match
+        if x.shape == x0.shape:
+            x = x + x0
         # Determine target angle dimension
         A = int(target_A) if target_A is not None else int(x.shape[-1])
         if A <= 0:

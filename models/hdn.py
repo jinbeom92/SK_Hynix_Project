@@ -21,7 +21,10 @@ This module defines helper functions `_gn` and `_has_antialias_arg`, the
 anti‑aliasing, and the top‑level `HDNSystem` class integrating all
 components.  The `HDNSystem.forward` method can optionally accept voxel
 volumes during training to enable the cheat path and produces both the
-predicted sinogram and reconstructed volume.
+predicted sinogram and reconstructed volume.  A residual skip connection
+is applied between the input sinogram and the decoder output so that the
+network learns only a correction term; this helps propagate low‑frequency
+information and improves gradient flow:contentReference[oaicite:5]{index=5}.
 """
 
 from __future__ import annotations
@@ -62,6 +65,14 @@ def _has_antialias_arg() -> bool:
 
 class SinoDecoder2D(nn.Module):
     """Decode XY feature maps back into XA sinograms.
+
+    This decoder takes XY feature maps and transforms them into sinograms by
+    mixing channels with a stack of residual Conv2D→GroupNorm→ReLU blocks,
+    applies a residual connection across the entire mixing stage when shapes
+    match, and then resizes the spatial dimensions from (X,Y) to (X,A) via
+    interpolation.  The residual design encourages the network to learn
+    corrections rather than complete mappings, improving gradient flow in
+    deep models:contentReference[oaicite:6]{index=6}.
 
     Parameters:
         in_ch: Number of input channels from fusion module.
@@ -165,7 +176,12 @@ class SinoDecoder2D(nn.Module):
             x = F_xy.view(B * Z, C, X, Y)
         else:
             raise ValueError(f"SinoDecoder2D expects [B,C,X,Y,(Z)], got {F_xy.shape}")
+        # Keep a copy of the pre‑mixing feature map for a residual connection
+        x0 = x
         x = self.mix(x)
+        # Apply a residual skip connection when spatial and channel shapes match
+        if x.shape == x0.shape:
+            x = x + x0
         x = self._interpolate_xy_to_xa(x, X, A)
         x = self.proj(x)  # [B*Z,1,X,A]
         sino = x.view(B, Z, 1, X, A).permute(0, 2, 3, 4, 1).contiguous()
@@ -325,6 +341,19 @@ class HDNSystem(nn.Module):
             fused_xy = self.fusion(f_xy, None)
         # Decode to [X,A,Z]
         sino_hat_xaz = self.sino_dec(fused_xy, A=A)
+        # --- Residual skip connection -------------------------------------------------------
+        # Add the input sinogram to the network output to implement a residual skip
+        # connection.  This encourages the network to learn only a correction term
+        # rather than reconstructing the entire sinogram from scratch.  The
+        # residual approach is widely used in deep tomography networks and
+        # mitigates vanishing gradient issues when training deep models
+        # :contentReference[oaicite:7]{index=7}.
+        # The input S has shape [B,1,X,A,Z] and matches the decoder output, so
+        # elementwise addition is valid.  Skip connections at this top level
+        # complement the internal convolutional pathways and help preserve
+        # low‑frequency content from the original measurement.
+        sino_hat_xaz = sino_hat_xaz + S
+        # Use the residual output for backprojection
         sino_for_bp = sino_hat_xaz
         # Optional PSF
         if self.psf.enabled:

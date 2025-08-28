@@ -29,12 +29,12 @@ geom:
   n_steps_cap: 256                 # Joseph integration steps along ray
 
 model:
-  enc1:   { base: 64, depth: 3 }                     # 1D over angle (A)
-  enc2:   { base: 64, depth: 3 }                     # 2D over (X×A)
+  enc1:   { base: 64, depth: 4 }                     # 1D over angle (A)
+  enc2:   { base: 64, depth: 4 }                     # 2D over (X×A)
   align:  { out_ch: 64, depth: 2, interp_mode: "bilinear" }  # Sino→XY align (resample to X×Y)
-  cheat2d: { enabled: true, base: 32, depth: 2 }     # (train-only) GT-derived hints
+  cheat2d: { enabled: true, base: 64, depth: 4 }     # (train-only) GT-derived hints
   fusion: { out_ch: 64 }                              # fuse enc/cheat features on XY
-  sino_dec: { mid_ch: 128, depth: 4, interp_mode: "bilinear", bound: "none" }  # XY→XA
+  sino_dec: { mid_ch: 64, depth: 4, interp_mode: "bilinear", bound: "none" }  # XY→XA
   clamp_recon: true            # clamp recon to [0,1] before loss/eval (safety)
   ir_impl: "grid"              # projector BP impl: {"grid","interp"}
   ir_interpolation: "linear"   # only used if ir_impl=="interp"
@@ -74,7 +74,7 @@ train:
   amp_dtype: "auto"          # {"bf16","fp16","auto"}
   optimizer: "adamw"         # {"adamw","adafactor"}
   lr: 3.0e-4
-  weight_decay: 1.0e-4
+  weight_decay: 0     # 1.0e-5
   batch_size: 8
   num_workers: 4
   grad_clip: 1.0
