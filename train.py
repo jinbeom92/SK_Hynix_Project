@@ -216,10 +216,11 @@ def main(cfg_path: str):
 
     # --- Loss: NearExpandMaskedCompositeLossV2 (boundary-aware composite) ------------------
     lcfg = cfg.get("losses", {})
+    # Configure loss: support both legacy "expand_*" keys and newer names
     criterion = NearExpandMaskedCompositeLossV2(
-        thr=float(lcfg.get("expand_thr", 0.8)),
-        near_value=float(lcfg.get("expand_near_value", 0.8)),
-        spacing=lcfg.get("expand_spacing", None),
+        thr=float(lcfg.get("thr", lcfg.get("expand_thr", 0.8))),
+        near_value=float(lcfg.get("near_value", lcfg.get("expand_near_value", 0.8))),
+        spacing=lcfg.get("spacing", lcfg.get("expand_spacing", None)),
         max_val=float(lcfg.get("max_val", 1.0)),
         # SSIM
         ssim_win_size=int(lcfg.get("ssim_win_size", 7)),
@@ -237,7 +238,9 @@ def main(cfg_path: str):
         weighted_mean_by_mask=bool(lcfg.get("weighted_mean_by_mask", True)),
         eps=float(lcfg.get("eps", 1e-8)),
     ).to(device)
-    clamp_pred_gt = bool(lcfg.get("expand_clamp", True))  # keep legacy flag name for IO clamping
+    # clamp_pred_gt controls clamping of predictions and ground truth before loss/eval.
+    # Check new key first; fall back to legacy expand_clamp for backwards compatibility.
+    clamp_pred_gt = bool(lcfg.get("clamp_pred_gt", lcfg.get("expand_clamp", True)))
 
     # --- Optimizer & misc hyperparams ------------------------------------------------------
     name = str(cfg["train"].get("optimizer", "adamw")).lower()

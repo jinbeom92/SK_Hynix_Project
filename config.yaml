@@ -1,11 +1,8 @@
 # ==============================================================================
 # HDN (Enc1+Enc2 → Align → Fusion → SinoDecoder → Unfiltered BP) — Training Config
-#
-# refs: Sino2XYAlign, DecoderSlice2D, Enc1_1D_Angle  :contentReference[oaicite:0]{index=0} :contentReference[oaicite:1]{index=1} :contentReference[oaicite:2]{index=2}
-#
 # Axes convention
-#  - Sinogram (x,a,z) → [B, 1, X, A, Z]
-#  - Volume   (x,y,z) → [B, 1, X, Y, Z]
+#   - Sinogram (x,a,z) → [B, 1, X, A, Z]
+#   - Volume   (x,y,z) → [B, 1, X, Y, Z]
 # Backprojection: differentiable, unfiltered; circular XY support; scale by θ_span/(2·A_eff).
 # ==============================================================================
 
@@ -16,11 +13,9 @@ data:
 
 projector:
   method: "joseph3d"
-  bp_span: "full"        # {"half","full","auto"}; auto: A>=300→full(0..360), else half(0..180)
-  dc_mode: "none"    # {"none","detector","angle","both"}; mean removal for unfiltered BP
   fbp_filter: "hamming"       # {"none","ramp","shepp-logan","cosine","hann","hamming"}
-  fbp_cutoff: 1.0          # 0.8~1.0
-  fbp_pad_mode: "next_pow2"
+  ir_circle: true
+  bp_span: "full"
 
 geom:
   voxel_size_xyz: [1.0, 1.0, 1.0]  # (sx, sy, sz)
@@ -31,7 +26,7 @@ geom:
 model:
   enc1:   { base: 64, depth: 4 }                     # 1D over angle (A)
   enc2:   { base: 64, depth: 4 }                     # 2D over (X×A)
-  align:  { out_ch: 64, depth: 2, interp_mode: "bilinear" }  # Sino→XY align (resample to X×Y)
+  align:  { out_ch: 64, depth: 2, interp_mode: "bilinear" }  # Sino→XY align
   cheat2d: { enabled: true, base: 64, depth: 4 }     # (train-only) GT-derived hints
   fusion: { out_ch: 64 }                              # fuse enc/cheat features on XY
   sino_dec: { mid_ch: 64, depth: 4, interp_mode: "bilinear", bound: "none" }  # XY→XA
@@ -75,7 +70,7 @@ train:
   optimizer: "adamw"         # {"adamw","adafactor"}
   lr: 3.0e-4
   weight_decay: 0     # 1.0e-5
-  batch_size: 8
+  batch_size: 20
   num_workers: 4
   grad_clip: 1.0
   grad_accum_steps: 1
