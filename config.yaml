@@ -62,6 +62,7 @@ losses:
   weighted_mean_by_mask: true
   eps: 1.0e-8
   max_val: 1.0                     # dynamic range for PSNR/SSIM constants
+  w_edge_contrast: 0.2
 
 train:
   seed: 1337

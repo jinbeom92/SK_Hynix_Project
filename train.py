@@ -39,27 +39,21 @@ from data.dataset import ConcatDepthSliceDataset
 from models.hdn import HDNSystem
 from physics.geometry import Parallel3DGeometry
 from physics.projector import make_projector
-from losses.losses import NearExpandMaskedCompositeLossV2, build_loss_from_cfg
+from losses.losses import (
+    NearExpandMaskedCompositeLossV2,
+    build_loss_from_cfg,
+    edge_contrast_slice_max_torch,
+)
 
 
 # ---------------------------------------
 # Small utilities
 # ---------------------------------------
 def _as_float(x):
-    """
-    Convert a scalar Tensor or Python numeric to plain float for logging.
-    Detaches Tensors to avoid keeping autograd history around.
-    """
     return float(x) if not torch.is_tensor(x) else float(x.detach().item())
 
 
 def _init_amp(device: torch.device, cfg: dict):
-    """
-    Initialize AMP controls (dtype, on/off) and GradScaler.
-
-    • amp_dtype: "bf16" | "fp16" | "auto" (auto prefers bf16 if supported on CUDA).
-    • amp: bool flag to enable autocast on CUDA.
-    """
     want = (cfg["train"].get("amp_dtype", "auto") or "auto").lower()
     if want == "bf16":
         amp_dtype = torch.bfloat16
@@ -73,22 +67,14 @@ def _init_amp(device: torch.device, cfg: dict):
 
 
 def _angles_from_cfg(A: int, device: torch.device, cfg: dict) -> torch.Tensor:
-    """
-    Return evenly spaced angles [A] in radians with correct span:
-    - cfg['projector']['bp_span'] in {'half','full','auto'}
-    - half → [0, π), full → [0, 2π), auto → A>=300 → full else half
-    Uses endpoint=False behavior to avoid duplicate 0/π or 0/2π.
-    """
     import math
     span_key = str(cfg.get("projector", {}).get("bp_span", "auto")).lower()
     if span_key == "full":
         theta_span = 2.0 * math.pi
     elif span_key == "half":
         theta_span = math.pi
-    else:  # auto
+    else:
         theta_span = (2.0 * math.pi) if A >= 300 else math.pi
-
-    # endpoint=False: make A samples in [0, theta_span)
     angles = torch.linspace(0.0, theta_span, steps=A + 1, device=device, dtype=torch.float32)[:-1]
     return angles
 
@@ -106,20 +92,14 @@ def evaluate_slicewise_composite(
     amp_enabled: bool = False,
     amp_dtype: torch.dtype = torch.float16,
 ) -> dict:
-    """
-    Compute mean composite loss + submetrics (MSE/SSIM/PSNR) on the held-out subset.
-
-    Returns
-    -------
-    dict with float values: {"loss": ..., "mse": ..., "ssim": or None, "psnr": or None}
-    """
     model.eval()
-    tot_loss, tot_mse, tot_ssim, tot_psnr, count = 0.0, 0.0, 0.0, 0.0, 0
+    tot_loss, tot_mse, tot_ssim, tot_psnr, tot_ec, count = 0.0, 0.0, 0.0, 0.0, 0.0, 0
     have_ssim = False
     have_psnr = False
+    have_ec = False
 
     for batch in dl_val:
-        S_ua = batch["sino_ua"].to(device, non_blocking=True)   # [B,U,A] (≡ [B,X,A])
+        S_ua = batch["sino_ua"].to(device, non_blocking=True)   # [B,U,A] ≡ [B,X,A]
         V_gt = batch["voxel_xy"].to(device, non_blocking=True)  # [B,1,X,Y]
         B = int(S_ua.shape[0])
 
@@ -128,16 +108,22 @@ def evaluate_slicewise_composite(
             _, recon = model(S_xaz, v_vol=None, train_mode=False)  # [B,1,X,Y,1]
             R2 = recon[..., 0]                                     # [B,1,X,Y]
             if clamp_pred_gt:
-                R2 = R2.clamp(0.0, 1.0)
+                R2c = R2.clamp(0.0, 1.0)
                 Vc = V_gt.clamp(0.0, 1.0)
             else:
+                R2c = R2
                 Vc = V_gt
-            loss_b, info = criterion(R2, Vc)  # scalar, dict or per-batch reduced
-            # criterion with reduction='mean' returns scalar loss + reduced info
+            # Composite loss and metrics
+            loss_b, info = criterion(R2c, Vc)
+            # Edge contrast metric (batch mean) for evaluation
+            mask = (V_gt > 0.0).float()
+            ec_tensor = edge_contrast_slice_max_torch(R2, mask, reduction="batch_mean")
+            ec_val = _as_float(ec_tensor)
+
             loss_val = _as_float(loss_b)
             mse_val = _as_float(info["mse"]) if (info.get("mse") is not None) else float("nan")
-            ssim_val = _as_float(info["ssim"]) if (info.get("ssim") is not None) else None
-            psnr_val = _as_float(info["psnr"]) if (info.get("psnr") is not None) else None
+            ssim_val = _as_float(info.get("ssim")) if (info.get("ssim") is not None) else None
+            psnr_val = _as_float(info.get("psnr")) if (info.get("psnr") is not None) else None
 
         tot_loss += loss_val * B
         if not math.isnan(mse_val):
@@ -148,28 +134,23 @@ def evaluate_slicewise_composite(
         if psnr_val is not None:
             tot_psnr += psnr_val * B
             have_psnr = True
+        tot_ec += ec_val * B
+        have_ec = True
         count += B
 
-    out = {"loss": (tot_loss / count) if count else float("nan"),
-           "mse":  (tot_mse  / count) if count else float("nan"),
-           "ssim": (tot_ssim / count) if (count and have_ssim) else None,
-           "psnr": (tot_psnr / count) if (count and have_psnr) else None}
-    return out
+    return {
+        "loss": (tot_loss / count) if count else float("nan"),
+        "mse": (tot_mse / count) if count else float("nan"),
+        "ssim": (tot_ssim / count) if (count and have_ssim) else None,
+        "psnr": (tot_psnr / count) if (count and have_psnr) else None,
+        "ec": (tot_ec / count) if (count and have_ec) else None,
+    }
 
 
 # ---------------------------------------
 # Main
 # ---------------------------------------
 def main(cfg_path: str):
-    """
-    Entry point: configuration → data discovery → per-group training with 80/20 split.
-
-    Logging
-    -------
-    CSV columns:
-      group, epoch, step, running_avg, loss_total, mse, psnr, ssim, val_loss, val_mse, val_psnr, val_ssim
-    """
-    # --- Config / device / seed ------------------------------------------------------------
     cfg = load_config(cfg_path)
     save_effective_config(cfg, Path(cfg_path).with_name("effective_config.json"))
 
@@ -177,7 +158,6 @@ def main(cfg_path: str):
     set_seed(int(cfg["train"]["seed"]))
     amp_enabled, amp_dtype, scaler = _init_amp(device, cfg)
 
-    # --- Discover files & group them -------------------------------------------------------
     data_root = cfg.get("data", {}).get("root", "data")
     sino_glob = cfg.get("data", {}).get("sino_glob", "sino/*_sino.npy")
     voxel_glob = cfg.get("data", {}).get("voxel_glob", "voxel/*_voxel.npy")
@@ -200,7 +180,6 @@ def main(cfg_path: str):
         for i in range(0, len(all_sino), files_per_group)
     ]
 
-    # --- Logging ---------------------------------------------------------------------------
     Path("results").mkdir(parents=True, exist_ok=True)
     ckpt_dir = Path(cfg["train"]["ckpt_dir"])
     ckpt_dir.mkdir(parents=True, exist_ok=True)
@@ -210,36 +189,34 @@ def main(cfg_path: str):
         fieldnames=[
             "group", "epoch", "step",
             "running_avg", "loss_total", "mse", "psnr", "ssim",
-            "val_loss", "val_mse", "val_psnr", "val_ssim",
+            "ec", "val_loss", "val_mse", "val_psnr", "val_ssim", "val_ec",
         ],
     )
 
-    # --- Loss: NearExpandMaskedCompositeLossV2 (boundary-aware composite) ------------------
+    # Loss: NearExpandMaskedCompositeLossV2 (composite of MSE/SSIM/PSNR)
     lcfg = cfg.get("losses", {})
     criterion = NearExpandMaskedCompositeLossV2(
         thr=float(lcfg.get("expand_thr", 0.8)),
         near_value=float(lcfg.get("expand_near_value", 0.8)),
         spacing=lcfg.get("expand_spacing", None),
         max_val=float(lcfg.get("max_val", 1.0)),
-        # SSIM
         ssim_win_size=int(lcfg.get("ssim_win_size", 7)),
         ssim_sigma=float(lcfg.get("ssim_sigma", 1.5)),
         ssim_grad=bool(lcfg.get("ssim_grad", True)),
-        # PSNR
         psnr_grad=bool(lcfg.get("psnr_grad", True)),
         psnr_ref=float(lcfg.get("psnr_ref", 40.0)),
-        # weights
         w_mse=float(lcfg.get("w_mse", 1.0)),
         w_ssim=float(lcfg.get("w_ssim", 0.0)),
         w_psnr=float(lcfg.get("w_psnr", 0.0)),
-        # reduction / weighting
         reduction=str(lcfg.get("reduction", "mean")),
         weighted_mean_by_mask=bool(lcfg.get("weighted_mean_by_mask", True)),
         eps=float(lcfg.get("eps", 1e-8)),
     ).to(device)
-    clamp_pred_gt = bool(lcfg.get("expand_clamp", True))  # legacy flag for clamping
+    clamp_pred_gt = bool(lcfg.get("expand_clamp", True))
 
-    # --- Optimizer & misc hyperparams ------------------------------------------------------
+    # Weight for edge contrast auxiliary loss (default 0.0).
+    w_edge_contrast = float(lcfg.get("w_edge_contrast", 0.0))
+
     name = str(cfg["train"].get("optimizer", "adamw")).lower()
     lr = float(cfg["train"]["lr"])
     wd = float(cfg["train"]["weight_decay"])
@@ -255,21 +232,18 @@ def main(cfg_path: str):
     beta = 0.98
     ema = None
 
-    # --- Training over groups --------------------------------------------------------------
     model = None
     opt = None
 
     for g_idx, (sino_paths, voxel_paths) in enumerate(groups):
         print(f"--- Training on group {g_idx + 1}/{len(groups)} (files {len(sino_paths)}) ---")
 
-        # Dataset (slice-level)
         ds = ConcatDepthSliceDataset(
             sino_paths=[str(p) for p in sino_paths],
             voxel_paths=[str(p) for p in voxel_paths],
             report=True,
         )
 
-        # Geometry & projector (Z=1 for slice training)
         U, A = ds.U, ds.A
         X, Y = ds.X, ds.Y
         Z = 1
@@ -288,19 +262,17 @@ def main(cfg_path: str):
         if model is None:
             projector = make_projector(str(cfg.get("projector", {}).get("method", "joseph3d")).lower(), geom).to(device)
 
-            # Wire runtime switches from cfg to projector
             proj_cfg = cfg.get("projector", {})
             model_cfg = cfg.get("model", {})
-            setattr(projector, "fbp_filter",
-                    str(proj_cfg.get("fbp_filter", getattr(projector, "fbp_filter", "none"))).lower())
-            setattr(projector, "ir_impl",
-                    str(model_cfg.get("ir_impl", getattr(projector, "ir_impl", "grid"))).lower())
+            setattr(projector, "fbp_filter",  str(proj_cfg.get("fbp_filter", getattr(projector, "fbp_filter", "none"))).lower())
+            setattr(projector, "fbp_cutoff",  float(proj_cfg.get("fbp_cutoff", getattr(projector, "fbp_cutoff", 1.0))))
+            setattr(projector, "fbp_pad_mode",str(proj_cfg.get("fbp_pad_mode",getattr(projector, "fbp_pad_mode","next_pow2"))).lower())
+            setattr(projector, "ir_impl", str(model_cfg.get("ir_impl", getattr(projector, "ir_impl", "grid"))).lower())
             setattr(projector, "ir_interpolation",
                     str(model_cfg.get("ir_interpolation", getattr(projector, "ir_interpolation", "linear"))).lower())
-            setattr(projector, "ir_circle",
-                    bool(model_cfg.get("ir_circle", getattr(projector, "ir_circle", True))))
-            setattr(projector, "bp_span",
-                    str(proj_cfg.get("bp_span", getattr(projector, "bp_span", "auto"))).lower())
+            setattr(projector, "ir_circle", bool(model_cfg.get("ir_circle", getattr(projector, "ir_circle", True))))
+            setattr(projector, "bp_span", str(proj_cfg.get("bp_span", getattr(projector, "bp_span", "auto"))).lower())
+            setattr(projector, "dc_mode", str(proj_cfg.get("dc_mode", getattr(projector, "dc_mode", "detector"))).lower())
 
             model = HDNSystem(cfg, projector=projector).to(device)
 
@@ -313,12 +285,8 @@ def main(cfg_path: str):
             else:
                 opt = optim.AdamW(model.parameters(), lr=lr, weight_decay=wd)
         else:
-            # Update geometry for new group
             model.projector.reset_geometry(geom)
 
-        # ------------------------------
-        # Explicit 80/20 split (per group)
-        # ------------------------------
         D_total = len(ds)
         all_idx = np.arange(D_total)
         rng = np.random.RandomState(int(cfg["train"]["seed"]) + g_idx)
@@ -352,9 +320,6 @@ def main(cfg_path: str):
         print(f"[split] train={len(idx_train)} ({len(idx_train)/max(1,D_total):.1%})  "
               f"val={len(idx_val)} ({len(idx_val)/max(1,D_total):.1%})")
 
-        # ------------------------------
-        # Epoch loop
-        # ------------------------------
         for epoch in range(1, epochs_per_group + 1):
             model.train()
             pbar = tqdm(dl_train, desc=f"group {g_idx + 1}, epoch {epoch}", dynamic_ncols=True)
@@ -363,24 +328,30 @@ def main(cfg_path: str):
             for batch in pbar:
                 steps += 1
 
-                # Batch tensors
-                S_ua = batch["sino_ua"].to(device, non_blocking=True)   # [B,U,A]  ≡ [B,X,A]
+                S_ua = batch["sino_ua"].to(device, non_blocking=True)   # [B,U,A] ≡ [B,X,A]
                 V_gt = batch["voxel_xy"].to(device, non_blocking=True)  # [B,1,X,Y]
 
-                # Model I/O canonicalization
                 S_xaz = S_ua.unsqueeze(1).unsqueeze(-1)  # [B,1,X,A,1]
                 V_xyz = V_gt.unsqueeze(-1)               # [B,1,X,Y,1]
 
-                # Forward pass, compute composite loss, and backward
                 with autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
                     _, recon = model(S_xaz, v_vol=V_xyz, train_mode=True)
-                    R2 = recon[..., 0]                              # [B,1,X,Y]
+                    R2 = recon[..., 0]  # [B,1,X,Y]
+                    # Clamp prediction and GT for composite loss
                     if clamp_pred_gt:
                         R2c = R2.clamp(0.0, 1.0)
-                        Vc  = V_gt.clamp(0.0, 1.0)
+                        Vc = V_gt.clamp(0.0, 1.0)
                     else:
                         R2c, Vc = R2, V_gt
-                    loss_tensor, info = criterion(R2c, Vc)          # scalar, dict
+                    # Composite loss
+                    loss_tensor, info = criterion(R2c, Vc)
+                    # Auxiliary edge contrast (batch mean) on raw prediction and GT mask
+                    ec_tensor_batch = edge_contrast_slice_max_torch(
+                        R2, (V_gt > 0.0).float(), reduction="batch_mean"
+                    )
+                    # Incorporate into total loss (maximize contrast → minimize -contrast)
+                    if w_edge_contrast != 0.0:
+                        loss_tensor = loss_tensor + (-w_edge_contrast) * ec_tensor_batch
                     loss = loss_tensor / accum_steps
 
                 if scaler.is_enabled():
@@ -400,13 +371,12 @@ def main(cfg_path: str):
                         opt.step()
                     opt.zero_grad(set_to_none=True)
 
-                # Update running average of loss
                 with torch.no_grad():
                     step_loss = float(loss_tensor.item())
                     ema = step_loss if ema is None else (beta * ema + (1.0 - beta) * step_loss)
                     running_avg = ema / (1.0 - beta ** steps)
+                    ec_val = float(ec_tensor_batch.detach().item())
 
-                # Log training metrics
                 csv_logger.log(
                     {
                         "group": g_idx + 1,
@@ -417,10 +387,12 @@ def main(cfg_path: str):
                         "mse": _as_float(info.get("mse")) if (info.get("mse") is not None) else "",
                         "psnr": _as_float(info.get("psnr")) if (info.get("psnr") is not None) else "",
                         "ssim": _as_float(info.get("ssim")) if (info.get("ssim") is not None) else "",
+                        "ec": ec_val,
                         "val_loss": "",
                         "val_mse": "",
                         "val_psnr": "",
                         "val_ssim": "",
+                        "val_ec": "",
                     },
                     flush=(steps % flush_every == 0),
                 )
@@ -431,25 +403,24 @@ def main(cfg_path: str):
                         "mse": f"{_as_float(info.get('mse')):.4f}" if info.get("mse") is not None else "na",
                         "ssim": f"{_as_float(info.get('ssim')):.4f}" if info.get("ssim") is not None else "na",
                         "psnr": f"{_as_float(info.get('psnr')):.2f}" if info.get("psnr") is not None else "na",
+                        "ec": f"{ec_val:.4f}",
                     },
                     refresh=False,
                 )
 
-                # Housekeeping
                 del S_ua, V_gt, S_xaz, V_xyz, recon, R2, loss_tensor, loss, info
                 if (steps % empty_cache_every) == 0:
                     gc.collect()
                     if torch.cuda.is_available():
                         torch.cuda.empty_cache()
 
-            # Validation (held‑out subset, cheat OFF)
+            # Validation
             val = evaluate_slicewise_composite(
                 model, dl_val, device, criterion,
                 clamp_pred_gt=clamp_pred_gt,
                 amp_enabled=amp_enabled, amp_dtype=amp_dtype
             )
 
-            # Log validation metrics
             csv_logger.log(
                 {
                     "group": g_idx + 1,
@@ -460,17 +431,18 @@ def main(cfg_path: str):
                     "mse": "",
                     "psnr": "",
                     "ssim": "",
+                    "ec": "",
                     "val_loss": val["loss"],
                     "val_mse": val["mse"],
-                    "val_psnr": ("" if val["psnr"] is None else val["psnr"]),
-                    "val_ssim": ("" if val["ssim"] is None else val["ssim"]),
+                    "val_psnr": ("" if val.get("psnr") is None else val["psnr"]),
+                    "val_ssim": ("" if val.get("ssim") is None else val["ssim"]),
+                    "val_ec": ("" if val.get("ec") is None else val["ec"]),
                 },
                 flush=True,
             )
 
-            # Track best validation loss and save checkpoint
             val_loss = float(val["loss"])
-            if not (val_loss != val_loss):  # skip NaN
+            if not (val_loss != val_loss):  # not NaN
                 if val_loss < best_val:
                     best_val = val_loss
                     state = {
@@ -488,7 +460,7 @@ def main(cfg_path: str):
 
 if __name__ == "__main__":
     import argparse
-    ap = argparse.ArgumentParser(description="Train HDN (slice‑wise) with explicit 80/20 split + composite boundary‑aware loss.")
+    ap = argparse.ArgumentParser(description="Train HDN (slice-wise) with explicit 80/20 split + composite boundary-aware loss.")
     ap.add_argument("--cfg", type=str, default="config.yaml", help="Path to YAML config.")
     args = ap.parse_args()
     main(args.cfg)
