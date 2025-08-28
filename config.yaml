@@ -15,7 +15,7 @@ projector:
   method: "joseph3d"
   fbp_filter: "hamming"       # {"none","ramp","shepp-logan","cosine","hann","hamming"}
   ir_circle: true
-  bp_span: "full"
+  bp_span: "auto"
 
 geom:
   voxel_size_xyz: [1.0, 1.0, 1.0]  # (sx, sy, sz)

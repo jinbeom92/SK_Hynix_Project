@@ -28,6 +28,87 @@ from scipy.ndimage import distance_transform_edt as edt
 
 __all__ = ["NearExpandMaskedCompositeLossV2", "build_loss_from_cfg"]
 
+################################################################################
+# Additional loss utilities
+################################################################################
+
+def _kernel8_no_center(device: torch.device | None = None, dtype: torch.dtype = torch.float32) -> torch.Tensor:
+    """Return a 3×3 kernel of ones with the center element set to zero.
+
+    This helper constructs a convolution kernel that sums the 8
+    neighbouring pixels of a 2D map, ignoring the center pixel.  It is
+    used by ``edge_contrast_slice_max_torch`` to find boundary pixels.
+
+    Args:
+        device: The device on which to allocate the tensor.  If None, the
+            current default device is used.
+        dtype: Data type of the returned tensor.
+
+    Returns:
+        A tensor of shape (1, 1, 3, 3) with dtype ``dtype`` and ones
+        everywhere except the center element, which is zero.
+    """
+    ker = torch.ones((1, 1, 3, 3), dtype=dtype, device=device)
+    ker[0, 0, 1, 1] = 0.0
+    return ker
+
+
+@torch.enable_grad()
+def edge_contrast_slice_max_torch(
+    x: torch.Tensor,
+    mask: torch.Tensor,
+    reduction: str = "per_sample",
+) -> torch.Tensor:
+    """Compute a simple edge‑contrast metric for 2D slices.
+
+    This function measures how sharply a predicted image ``x`` falls off at
+    object boundaries defined by ``mask``.  The metric is computed slice‑wise
+    (per sample) and can be returned either per sample, averaged over the
+    batch, or with no reduction.
+
+    Args:
+        x: A tensor of shape (B, 1, H, W) containing predicted values.  It
+            must have ``requires_grad=True`` to allow gradient flow.
+        mask: A tensor broadcastable to (B, 1, H, W) containing binary
+            foreground/background labels.  Foreground pixels have value 1.
+        reduction: Reduction mode – ``"per_sample"`` returns a (B, 1)
+            tensor of edge contrast values per batch element; ``"batch_mean"``
+            returns a scalar; ``"none"`` returns the full contrast map and
+            boundary indicator.
+
+    Returns:
+        Depending on ``reduction``: a contrast map and boundary mask (if
+        ``none``), a tensor of shape (B, 1) with per‑sample values (if
+        ``per_sample``), or a scalar (if ``batch_mean``).
+
+    Raises:
+        ValueError: If ``reduction`` is not one of the allowed strings.
+    """
+    device, dtype = x.device, x.dtype
+    # Convert mask to boolean foreground, and compute its complement
+    m = mask.to(device=device).bool()
+    outN = (~m).float()
+    # Convolve the complement to count the number of neighbouring background pixels
+    ker = _kernel8_no_center(device=device, dtype=dtype)
+    cnt_out = F.conv2d(outN, ker, padding=1)
+    # Boundary indicator: a foreground pixel that has at least one background neighbour
+    ib = (m & (cnt_out > 0))
+    # Maximum of x within a 3×3 neighbourhood on background pixels
+    max_out = F.max_pool2d(x * outN, kernel_size=3, stride=1, padding=1)
+    contrast = (x - max_out) * ib.float()
+    # No reduction: return full contrast map and boundary indicator
+    if reduction == "none":
+        return contrast, ib
+    # Per-sample reduction: average contrast over boundary pixels
+    num = ib.float().sum(dim=(2, 3), keepdim=False).clamp_min(1.0)
+    ec_per = contrast.sum(dim=(2, 3), keepdim=False) / num
+    if reduction == "per_sample":
+        return ec_per
+    elif reduction == "batch_mean":
+        return ec_per.mean()
+    else:
+        raise ValueError("reduction must be one of: none, per_sample, batch_mean")
+
 
 class NearExpandMaskedCompositeLossV2(nn.Module):
     """Composite loss using near‑expand masking, MSE, SSIM and PSNR.

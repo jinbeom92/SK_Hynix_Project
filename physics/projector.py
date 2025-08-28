@@ -72,10 +72,28 @@ class JosephProjector3D(BaseProjector3D):
         *,
         ir_circle: bool = True,
         fbp_filter: str = "ramp",
+        bp_span: str = "auto",
     ) -> None:
+        """
+        Parameters
+        ----------
+        geom : Parallel3DGeometry
+            Geometry describing the detector and volume sizes.
+        ir_circle : bool, optional
+            If True, reconstruct only within the inscribed circle and zero outside.
+        fbp_filter : str, optional
+            Name of the 1D frequency-domain filter: {"ramp","shepp-logan",
+            "cosine","hamming","hann","none"}.  Default is "ramp".
+        bp_span : {"auto","half","full"}, optional
+            Behaviour for handling the angular span during backprojection:
+            - "full": always use all angles (no deduplication).
+            - "half": always reduce even-angle sinograms by averaging opposing angles.
+            - "auto": scikit-image style – if A==360, fold to 180°; otherwise keep as is.
+        """
         super().__init__(geom)
         self.ir_circle = bool(ir_circle)
         self.fbp_filter = str(fbp_filter).lower()
+        self.bp_span = str(bp_span).lower()
 
     # -------------------------------------------------------------------------
     # Helper: Fourier filter
@@ -235,10 +253,12 @@ class JosephProjector3D(BaseProjector3D):
         Reconstruct a volume from a sinogram.
 
         Takes a 5D sinogram `[B,C,X,A,Z]` and returns a reconstructed volume
-        `[B,C,X,Y,Z]`.  For each depth slice, if the number of angles A is even
-        the sinogram is reduced from 360° to 180° by averaging opposing angles
-        before filtering and backprojection.  The 2D backprojection itself is
-        computed by `_iradon_scikit_grid`.
+        `[B,C,X,Y,Z]`.  For each depth slice the angular span is handled
+        according to `bp_span`:
+          * "full" – use the full set of angles.
+          * "half" – reduce even-angle sinograms by averaging opposing angles.
+          * "auto" – if A==360, fold to 180°; otherwise leave unchanged.
+        The 2D backprojection itself is computed by `_iradon_scikit_grid`.
 
         The resulting 2D slice from `_iradon_scikit_grid` is square (shape
         `[Y_rec, Y_rec]`) where `Y_rec` is either the padded detector length or
@@ -260,12 +280,25 @@ class JosephProjector3D(BaseProjector3D):
             for c in range(C):
                 for z in range(Z):
                     s2d = sino[b, c, :, :, z]  # [X,A]
-                    # If A is even, treat as full 360° and reduce to 180°
-                    s2d_use = self._dedup_360_to_180(s2d)
+                    # Select sinogram for backprojection based on bp_span
+                    mode = self.bp_span
+                    if mode == "full":
+                        s2d_use = s2d
+                    elif mode == "half":
+                        # Always fold even-angle sinograms
+                        if A % 2 == 0:
+                            s2d_use = self._dedup_360_to_180(s2d)
+                        else:
+                            s2d_use = s2d
+                    else:  # "auto" or any other
+                        # scikit-image style: fold only 360-angle sinograms
+                        if A == 360:
+                            s2d_use = self._dedup_360_to_180(s2d)
+                        else:
+                            s2d_use = s2d
                     # Backproject to obtain a square slice rec_yy [Y_rec,Y_rec]
                     rec_yy = self._iradon_scikit_grid(s2d_use)
                     # Always resize rec_yy to match geometry size (X,Y) using bilinear interpolation.
-                    # This handles cases where the padded detector length differs from the target size.
                     rec_yx = F.interpolate(
                         rec_yy.unsqueeze(0).unsqueeze(0),
                         size=(X, Y),
@@ -284,7 +317,7 @@ def make_projector(method: Literal["joseph3d"], geom: Parallel3DGeometry) -> Bas
 
     Only 'joseph3d' is supported here.  Returns an instance of
     `JosephProjector3D` initialised with the given geometry.  The caller may
-    override its `ir_circle` and `fbp_filter` attributes after construction.
+    override its `ir_circle`, `fbp_filter` and `bp_span` attributes after construction.
     """
     if method != "joseph3d":
         raise ValueError(f"Unknown projector method: {method}")

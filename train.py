@@ -216,11 +216,10 @@ def main(cfg_path: str):
 
     # --- Loss: NearExpandMaskedCompositeLossV2 (boundary-aware composite) ------------------
     lcfg = cfg.get("losses", {})
-    # Configure loss: support both legacy "expand_*" keys and newer names
     criterion = NearExpandMaskedCompositeLossV2(
-        thr=float(lcfg.get("thr", lcfg.get("expand_thr", 0.8))),
-        near_value=float(lcfg.get("near_value", lcfg.get("expand_near_value", 0.8))),
-        spacing=lcfg.get("spacing", lcfg.get("expand_spacing", None)),
+        thr=float(lcfg.get("expand_thr", 0.8)),
+        near_value=float(lcfg.get("expand_near_value", 0.8)),
+        spacing=lcfg.get("expand_spacing", None),
         max_val=float(lcfg.get("max_val", 1.0)),
         # SSIM
         ssim_win_size=int(lcfg.get("ssim_win_size", 7)),
@@ -238,9 +237,7 @@ def main(cfg_path: str):
         weighted_mean_by_mask=bool(lcfg.get("weighted_mean_by_mask", True)),
         eps=float(lcfg.get("eps", 1e-8)),
     ).to(device)
-    # clamp_pred_gt controls clamping of predictions and ground truth before loss/eval.
-    # Check new key first; fall back to legacy expand_clamp for backwards compatibility.
-    clamp_pred_gt = bool(lcfg.get("clamp_pred_gt", lcfg.get("expand_clamp", True)))
+    clamp_pred_gt = bool(lcfg.get("expand_clamp", True))  # legacy flag for clamping
 
     # --- Optimizer & misc hyperparams ------------------------------------------------------
     name = str(cfg["train"].get("optimizer", "adamw")).lower()
@@ -291,18 +288,19 @@ def main(cfg_path: str):
         if model is None:
             projector = make_projector(str(cfg.get("projector", {}).get("method", "joseph3d")).lower(), geom).to(device)
 
-            # Wire runtime switches from cfg to projector (span/DC/impl)
+            # Wire runtime switches from cfg to projector
             proj_cfg = cfg.get("projector", {})
             model_cfg = cfg.get("model", {})
-            setattr(projector, "fbp_filter",  str(proj_cfg.get("fbp_filter",  getattr(projector, "fbp_filter",  "none"))).lower())
-            setattr(projector, "fbp_cutoff",  float(proj_cfg.get("fbp_cutoff", getattr(projector, "fbp_cutoff", 1.0))))
-            setattr(projector, "fbp_pad_mode",str(proj_cfg.get("fbp_pad_mode",getattr(projector, "fbp_pad_mode","next_pow2"))).lower())
-            setattr(projector, "ir_impl", str(model_cfg.get("ir_impl", getattr(projector, "ir_impl", "grid"))).lower())
+            setattr(projector, "fbp_filter",
+                    str(proj_cfg.get("fbp_filter", getattr(projector, "fbp_filter", "none"))).lower())
+            setattr(projector, "ir_impl",
+                    str(model_cfg.get("ir_impl", getattr(projector, "ir_impl", "grid"))).lower())
             setattr(projector, "ir_interpolation",
                     str(model_cfg.get("ir_interpolation", getattr(projector, "ir_interpolation", "linear"))).lower())
-            setattr(projector, "ir_circle", bool(model_cfg.get("ir_circle", getattr(projector, "ir_circle", True))))
-            setattr(projector, "bp_span", str(proj_cfg.get("bp_span", getattr(projector, "bp_span", "auto"))).lower())
-            setattr(projector, "dc_mode", str(proj_cfg.get("dc_mode", getattr(projector, "dc_mode", "detector"))).lower())
+            setattr(projector, "ir_circle",
+                    bool(model_cfg.get("ir_circle", getattr(projector, "ir_circle", True))))
+            setattr(projector, "bp_span",
+                    str(proj_cfg.get("bp_span", getattr(projector, "bp_span", "auto"))).lower())
 
             model = HDNSystem(cfg, projector=projector).to(device)
 
@@ -310,12 +308,12 @@ def main(cfg_path: str):
                 model = torch.compile(model)
 
             if name == "adafactor":
-                # If your tree exposes Adafactor under optim.adafactor, keep this path.
                 from optim.adafactor import Adafactor
                 opt = Adafactor(model.parameters(), lr=lr, weight_decay=wd)
             else:
                 opt = optim.AdamW(model.parameters(), lr=lr, weight_decay=wd)
         else:
+            # Update geometry for new group
             model.projector.reset_geometry(geom)
 
         # ------------------------------
@@ -329,7 +327,7 @@ def main(cfg_path: str):
         train_ratio = float(cfg["train"].get("train_ratio", 0.8))
         n_train = int(round(D_total * train_ratio))
         if D_total >= 2:
-            n_train = max(1, min(D_total - 1, n_train))  # ensure both splits non-empty
+            n_train = max(1, min(D_total - 1, n_train))
         else:
             n_train = 1
 
@@ -366,14 +364,14 @@ def main(cfg_path: str):
                 steps += 1
 
                 # Batch tensors
-                S_ua = batch["sino_ua"].to(device, non_blocking=True)   # [B,U,A]  (≡ [B,X,A])
+                S_ua = batch["sino_ua"].to(device, non_blocking=True)   # [B,U,A]  ≡ [B,X,A]
                 V_gt = batch["voxel_xy"].to(device, non_blocking=True)  # [B,1,X,Y]
 
                 # Model I/O canonicalization
                 S_xaz = S_ua.unsqueeze(1).unsqueeze(-1)  # [B,1,X,A,1]
                 V_xyz = V_gt.unsqueeze(-1)               # [B,1,X,Y,1]
 
-                # Forward, composite loss, grad
+                # Forward pass, compute composite loss, and backward
                 with autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
                     _, recon = model(S_xaz, v_vol=V_xyz, train_mode=True)
                     R2 = recon[..., 0]                              # [B,1,X,Y]
@@ -402,12 +400,13 @@ def main(cfg_path: str):
                         opt.step()
                     opt.zero_grad(set_to_none=True)
 
-                # Running EMA + step logging
+                # Update running average of loss
                 with torch.no_grad():
                     step_loss = float(loss_tensor.item())
                     ema = step_loss if ema is None else (beta * ema + (1.0 - beta) * step_loss)
                     running_avg = ema / (1.0 - beta ** steps)
 
+                # Log training metrics
                 csv_logger.log(
                     {
                         "group": g_idx + 1,
@@ -443,13 +442,14 @@ def main(cfg_path: str):
                     if torch.cuda.is_available():
                         torch.cuda.empty_cache()
 
-            # Validation (held-out subset, cheat OFF)
+            # Validation (held‑out subset, cheat OFF)
             val = evaluate_slicewise_composite(
                 model, dl_val, device, criterion,
                 clamp_pred_gt=clamp_pred_gt,
                 amp_enabled=amp_enabled, amp_dtype=amp_dtype
             )
 
+            # Log validation metrics
             csv_logger.log(
                 {
                     "group": g_idx + 1,
@@ -468,9 +468,9 @@ def main(cfg_path: str):
                 flush=True,
             )
 
-            # Best checkpoint by lowest validation loss (skip if NaN)
+            # Track best validation loss and save checkpoint
             val_loss = float(val["loss"])
-            if not (val_loss != val_loss):  # not NaN
+            if not (val_loss != val_loss):  # skip NaN
                 if val_loss < best_val:
                     best_val = val_loss
                     state = {
@@ -488,7 +488,7 @@ def main(cfg_path: str):
 
 if __name__ == "__main__":
     import argparse
-    ap = argparse.ArgumentParser(description="Train HDN (slice-wise) with explicit 80/20 split + composite boundary-aware loss.")
+    ap = argparse.ArgumentParser(description="Train HDN (slice‑wise) with explicit 80/20 split + composite boundary‑aware loss.")
     ap.add_argument("--cfg", type=str, default="config.yaml", help="Path to YAML config.")
     args = ap.parse_args()
     main(args.cfg)
