@@ -268,7 +268,6 @@ def main(cfg_path: str):
             setattr(projector, "ir_impl", str(model_cfg.get("ir_impl", getattr(projector, "ir_impl", "grid"))).lower())
             setattr(projector, "ir_interpolation",
                     str(model_cfg.get("ir_interpolation", getattr(projector, "ir_interpolation", "linear"))).lower())
-            setattr(projector, "ir_circle", bool(model_cfg.get("ir_circle", getattr(projector, "ir_circle", True))))
             setattr(projector, "bp_span", str(proj_cfg.get("bp_span", getattr(projector, "bp_span", "auto"))).lower())
             setattr(projector, "dc_mode", str(proj_cfg.get("dc_mode", getattr(projector, "dc_mode", "detector"))).lower())
 

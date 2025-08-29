@@ -2,6 +2,11 @@
 High‑Dimensional Network (HDN) implementation with encoders, alignment,
 cheat fusion, 2D decoding, optional PSF and physics‑based backprojection.
 
+Circular masking and span handling (e.g., `ir_circle`, 180°/360° folding) are handled entirely by the
+projector; HDN performs no additional post‑processing. :contentReference[oaicite:0]{index=0}
+
+This file supersedes earlier `HDNSystem` variants by removing any `ir_circle` handling here. :contentReference[oaicite:1]{index=1}
+
 The HDN architecture follows the pipeline Enc1→Enc2→Sino2XYAlign→VoxelCheat2D
 (optional)→Fusion2D→SinoDecoder2D→Backprojection.  Sinogram inputs
 [B,1,X,A,Z] are processed slice‑wise along the depth dimension.  Enc1
@@ -12,20 +17,7 @@ ground truth voxel slices to serve as hints during training; Fusion2D mixes
 sinogram and cheat features; SinoDecoder2D upsamples from (X,Y) back to
 (X,A) and stacks along the angle dimension to form a predicted sinogram
 [B,1,X,A,Z].  Finally, a Joseph ray‑driven backprojector applies a
-scikit‑image‑like filtered inverse Radon transform on each slice.  If a
-360° sinogram is provided, the backprojector automatically averages opposing
-angles to form a 180° sinogram before inversion and scales the result by
-π/(2·A_eff), matching scikit‑image’s normalisation:contentReference[oaicite:0]{index=0}.
-
-This module defines helper functions `_gn` and `_has_antialias_arg`, the
-`SinoDecoder2D` class for XY→XA decoding with optional output bounding and
-anti‑aliasing, and the top‑level `HDNSystem` class integrating all
-components.  The `HDNSystem.forward` method can optionally accept voxel
-volumes during training to enable the cheat path and produces both the
-predicted sinogram and reconstructed volume.  A residual skip connection
-is applied between the input sinogram and the decoder output so that the
-network learns only a correction term; this helps propagate low‑frequency
-information and improves gradient flow:contentReference[oaicite:1]{index=1}.
+scikit‑image‑like filtered inverse Radon transform on each slice.
 """
 
 from __future__ import annotations
@@ -71,10 +63,9 @@ class HDNSystem(nn.Module):
         m = cfg.get("model", cfg)
         dbg = cfg.get("debug", {})
 
-        # Propagate only supported projector attributes (ir_circle, fbp_filter)
+        # Propagate projector attributes (fbp_filter only); `ir_circle` is handled by the projector. :contentReference[oaicite:2]{index=2}
         proj_cfg = cfg.get("projector", {})
         attr_map = {
-            "ir_circle": "ir_circle",
             "fbp_filter": "fbp_filter",
             "ir_filter": "fbp_filter",  # legacy key maps to fbp_filter
         }
@@ -137,6 +128,7 @@ class HDNSystem(nn.Module):
             sigma_u=float(psf_cfg.get("sigma_u", 0.7)),
             sigma_v=float(psf_cfg.get("sigma_v", 0.7)),
         )
+
         self.clamp_recon = bool(m.get("clamp_recon", False))
         self.strict_geometry = bool(m.get("strict_geometry", dbg.get("strict_geometry", False)))
 

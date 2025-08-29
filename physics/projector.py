@@ -140,21 +140,19 @@ class JosephProjector3D(BaseProjector3D):
         """
         Differentiable 2D filtered backprojection using grid_sample.
 
-        This implementation:
-        • Pads the detector axis to a circumscribed square when `ir_circle=True`.
-        • Zero‑pads to the next power‑of‑two for FFT, applies a 1D frequency‑domain
-            filter (ramp / Shepp–Logan / cosine / Hamming / Hann / none).
-        • Performs inverse Radon by bilinearly sampling t = y·cosθ − x·sinθ.
-        • Scales the result by π/(2·A).
-        • **Applies a resolution‑based circular mask** when `ir_circle=True`:
-            pixels outside a circle of radius `Y/2` (half the output resolution),
-            centred at `((Y-1)/2, (Y-1)/2)`, are set to zero.
+        Change
+        ------
+        When ``ir_circle=True``, do **not** pad the detector axis to a
+        circumscribed square. Assume the input is square (X==Y), keep the
+        native detector length ``N``, and rely solely on the final circular
+        mask. This preserves spatial consistency and avoids unnecessary
+        resampling while keeping FFT padding along the detector axis. :contentReference[oaicite:1]{index=1}
 
         Args:
-            radon_image: 2D sinogram tensor of shape [N, A] (detector, angles).
+            radon_image: Tensor [N, A] (detector, angles).
 
         Returns:
-            Reconstructed square image tensor [Y, Y] (float dtype preserved).
+            Tensor [Y, Y] reconstruction (dtype preserved).
         """
         device = radon_image.device
         dtype = radon_image.dtype
@@ -163,35 +161,27 @@ class JosephProjector3D(BaseProjector3D):
         sino = radon_image.to(torch.float32)
         N, A = sino.shape
 
-        # If reconstructing within the circle, first pad detector to circumscribed square
-        if self.ir_circle:
-            diag = int(math.ceil(math.sqrt(2.0) * N))
-            pad = diag - N
-            old_center = N // 2
-            new_center = diag // 2
-            pad_before = new_center - old_center
-            sino = F.pad(sino, (0, 0, pad_before, pad - pad_before))  # [N', A]
-            N = int(sino.shape[0])
+        # ------------------------------------------------------------
+        # (CHANGED) No detector→square padding when ir_circle=True.
+        # We keep N unchanged and apply a final circular mask only.
+        # ------------------------------------------------------------
 
-        # Zero‑pad along detector to next power‑of‑two (>=64) for FFT
+        # Zero‑pad to next power‑of‑two (>=64) along detector axis for FFT
         P = max(64, 1 << int(math.ceil(math.log2(2 * N))))
         sino_pad = F.pad(sino, (0, 0, 0, P - N))  # [P, A]
 
-        # 1D frequency‑domain filter along detector (per angle)
+        # 1D frequency‑domain filter along detector
         H = self._fourier_filter_torch(P, self.fbp_filter, device=sino_pad.device, dtype=torch.float32)
-        Xf = torch.fft.rfft(sino_pad, dim=0)                          # [P_rfft, A]
-        Yf = Xf * H[: Xf.shape[0]].unsqueeze(1)                       # [P_rfft, A]
-        sino_filt = torch.fft.irfft(Yf, n=P, dim=0)[:N, :]            # [N, A]
+        Xf = torch.fft.rfft(sino_pad, dim=0)                        # [P_rfft, A]
+        Yf = Xf * H[: Xf.shape[0]].unsqueeze(1)                     # [P_rfft, A]
+        sino_filt = torch.fft.irfft(Yf, n=P, dim=0)[:N, :]          # [N, A]
 
-        # Output side length
+        # Output side length (square slice here)
         Y = N if self.ir_circle else int(math.floor((N**2) / 2.0) ** 0.5)
 
-        # Coordinate system: pixel centres with half‑pixel offset
+        # Build centred mesh for sampling (pixel‑centre convention)
         cy = (Y - 1) * 0.5
         cx = (Y - 1) * 0.5
-        r = 0.5 * float(Y)  # resolution‑half radius
-
-        # Meshgrid (centred)
         yy, xx = torch.meshgrid(
             torch.arange(Y, dtype=torch.float32, device=device) - cy,
             torch.arange(Y, dtype=torch.float32, device=device) - cx,
@@ -223,15 +213,18 @@ class JosephProjector3D(BaseProjector3D):
                 .unsqueeze(-1)        # [A, 1, N, 1]
                 .expand(-1, 1, N, A)  # [A, 1, N, A]
         )
-        recon_per_angle = F.grid_sample(inp, grid, mode="bilinear", padding_mode="zeros", align_corners=True)  # [A,1,Y,Y]
+        recon_per_angle = F.grid_sample(
+            inp, grid, mode="bilinear", padding_mode="zeros", align_corners=True
+        )  # [A,1,Y,Y]
         recon = recon_per_angle.sum(dim=0)[0]  # [Y, Y]
 
         # Normalisation π/(2·A)
         recon *= (math.pi / (2.0 * A))
 
-        # Resolution‑half circular mask (apply when ir_circle=True)
+        # Final circular mask (inscribed circle on the Y×Y grid)
         if self.ir_circle:
-            mask = (xx**2 + yy**2) <= (r * r)
+            r = (Y - 1) * 0.5
+            mask = (xx * xx + yy * yy) <= (r * r)
             recon = recon * mask.to(recon.dtype)
 
         return recon.to(dtype)
