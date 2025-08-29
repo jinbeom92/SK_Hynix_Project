@@ -29,7 +29,7 @@ model:
   align:  { out_ch: 64, depth: 2, interp_mode: "bilinear" }  # Sino→XY align
   cheat2d: { enabled: true, base: 64, depth: 4 }     # (train-only) GT-derived hints
   fusion: { out_ch: 64 }                              # fuse enc/cheat features on XY
-  sino_dec: { mid_ch: 64, depth: 4, interp_mode: "bilinear", bound: "none" }  # XY→XA
+  sino_dec: { mid_ch: 64, depth: 4, interp_mode: "bilinear", bound: "sigmoid" }  # XY→XA
   clamp_recon: true            # clamp recon to [0,1] before loss/eval (safety)
   ir_impl: "grid"              # projector BP impl: {"grid","interp"}
   ir_interpolation: "linear"   # only used if ir_impl=="interp"

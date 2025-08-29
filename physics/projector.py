@@ -144,8 +144,10 @@ class JosephProjector3D(BaseProjector3D):
         `ir_circle=True`, zero-pads to the next power-of-two along the detector
         axis, applies a 1D frequency-domain filter, and then performs the
         inverse Radon transform by bilinearly sampling at coordinates
-        t = y·cosθ − x·sinθ.  The result is scaled by π/(2·A) as in
-        Kak & Slaney:contentReference[oaicite:4]{index=4}.
+        t = y·cosθ − x·sinθ.  The result is scaled by π/(2·A).
+
+        NOTE: The circular mask follows the ASTRA example's half‑pixel inscribed
+        circle: center at ((Y-1)/2,(Y-1)/2) and radius r = (Y-1)/2.
         """
         device = radon_image.device
         dtype = radon_image.dtype
@@ -166,29 +168,36 @@ class JosephProjector3D(BaseProjector3D):
 
         # Zero-pad to next power-of-two (>=64) along detector axis for FFT
         P = max(64, 1 << int(math.ceil(math.log2(2 * N))))
-        sino_pad = F.pad(sino, (0, 0, 0, P - N))  # shape [P, A]
+        sino_pad = F.pad(sino, (0, 0, 0, P - N))  # [P, A]
 
-        # Construct frequency-domain filter and apply
+        # 1D frequency-domain filter
         H = self._fourier_filter_torch(P, self.fbp_filter, device=sino_pad.device, dtype=torch.float32)
-        Xf = torch.fft.rfft(sino_pad, dim=0)  # [P_rfft,A]
+        Xf = torch.fft.rfft(sino_pad, dim=0)  # [P_rfft, A]
         Yf = Xf * H[: Xf.shape[0]].unsqueeze(1)
-        sino_filt = torch.fft.irfft(Yf, n=P, dim=0)[:N, :]  # [N,A]
+        sino_filt = torch.fft.irfft(Yf, n=P, dim=0)[:N, :]  # [N, A]
 
-        # Determine output size: square of side Y
+        # Output square side
         if self.ir_circle:
             Y = N
         else:
             Y = int(math.floor((N**2) / 2.0) ** 0.5)
-        radius = Y // 2
 
-        # Build sampling grid [A,Y,Y,2]
+        # --- ASTRA-like pixel-center coordinates (half-pixel offset) ---
+        # Center at ((Y-1)/2, (Y-1)/2), radius r = (Y-1)/2
+        cy = (Y - 1) * 0.5
+        cx = (Y - 1) * 0.5
+        r = (Y - 1) * 0.5
+
+        # Build sampling grid [A, Y, Y, 2]
         yy, xx = torch.meshgrid(
-            torch.arange(Y, dtype=torch.float32, device=device) - radius,
-            torch.arange(Y, dtype=torch.float32, device=device) - radius,
+            torch.arange(Y, dtype=torch.float32, device=device) - cy,
+            torch.arange(Y, dtype=torch.float32, device=device) - cx,
             indexing="ij",
         )
         theta = torch.arange(A, dtype=torch.float32, device=device) * (math.pi / A)
         t = yy.unsqueeze(0) * torch.cos(theta).view(-1, 1, 1) - xx.unsqueeze(0) * torch.sin(theta).view(-1, 1, 1)
+
+        # Normalise detector axis to [-1,1] (pixel centers) and angle axis to [-1,1]
         t_norm = (2.0 * (t + (N - 1) / 2.0) / max(1, N - 1)) - 1.0
         if A > 1:
             a_norm = (2.0 * torch.arange(A, dtype=torch.float32, device=device) / (A - 1)) - 1.0
@@ -197,30 +206,30 @@ class JosephProjector3D(BaseProjector3D):
         grid = torch.stack(
             [
                 a_norm.view(-1, 1, 1).expand(-1, Y, Y),  # x = angle axis
-                t_norm,                                    # y = detector axis
+                t_norm,                                   # y = detector axis
             ],
             dim=-1,
-        )  # [A,Y,Y,2]
+        )  # [A, Y, Y, 2]
 
         # Sample sinogram using grid_sample
         inp = (
-            sino_filt.permute(1, 0)    # [A, N]
-                .unsqueeze(1)       # [A, 1, N]
-                .unsqueeze(-1)      # [A, 1, N, 1]
+            sino_filt.permute(1, 0)   # [A, N]
+                .unsqueeze(1)         # [A, 1, N]
+                .unsqueeze(-1)        # [A, 1, N, 1]
                 .expand(-1, 1, N, A)  # [A, 1, N, A]
         )
         recon_per_angle = F.grid_sample(
             inp, grid, mode="bilinear", padding_mode="zeros", align_corners=True
-        )  # [A,1,Y,Y]
-        recon = recon_per_angle.sum(dim=0)[0]  # sum over angles → [Y,Y]
+        )  # [A, 1, Y, Y]
+        recon = recon_per_angle.sum(dim=0)[0]  # [Y, Y]
 
-        # Scale by π/(2·A):contentReference[oaicite:5]{index=5}
+        # Scale by π/(2·A)
         recon *= (math.pi / (2.0 * A))
 
-        # Apply circular mask if requested
+        # Apply ASTRA-style half‑pixel inscribed circular mask
         if self.ir_circle:
-            mask = (xx**2 + yy**2) > (radius**2)
-            recon = torch.where(mask, torch.zeros_like(recon), recon)
+            outside = (xx**2 + yy**2) > (r * r)
+            recon = recon.masked_fill(outside, 0.0)
 
         return recon.to(dtype)
 
@@ -305,7 +314,6 @@ class JosephProjector3D(BaseProjector3D):
                         mode="bilinear",
                         align_corners=False,
                     )[0, 0]
-                    # Transpose to produce [X,Y]
                     rec_xy = rec_yx.t()
                     out[b, c, :, :, z] = rec_xy
         return out

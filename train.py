@@ -17,8 +17,8 @@ Core behavior
 Notes on model blocks
 ---------------------
 The system expects Sino→XY alignment and 2D slice decoding blocks consistent with your
-Sino2XYAlign (mixing on (X,A) then resize to (X,Y)) and DecoderSlice2D; angle-wise 1D
-encoders follow Enc1_1D_Angle. These contracts remain unchanged.  # see repo modules
+Sino2XYAlign (mixing on (X,A) then resize to (X,Y)) and DecoderSlice2D; angle‑wise 1D
+encoders follow Enc1_1D_Angle. These contracts remain unchanged.
 """
 
 from pathlib import Path
@@ -41,10 +41,8 @@ from physics.geometry import Parallel3DGeometry
 from physics.projector import make_projector
 from losses.losses import (
     NearExpandMaskedCompositeLossV2,
-    build_loss_from_cfg,
     edge_contrast_slice_max_torch,
 )
-
 
 # ---------------------------------------
 # Small utilities
@@ -113,9 +111,8 @@ def evaluate_slicewise_composite(
             else:
                 R2c = R2
                 Vc = V_gt
-            # Composite loss and metrics
             loss_b, info = criterion(R2c, Vc)
-            # Edge contrast metric (batch mean) for evaluation
+            # Edge contrast metric for eval
             mask = (V_gt > 0.0).float()
             ec_tensor = edge_contrast_slice_max_torch(R2, mask, reduction="batch_mean")
             ec_val = _as_float(ec_tensor)
@@ -152,6 +149,7 @@ def evaluate_slicewise_composite(
 # ---------------------------------------
 def main(cfg_path: str):
     cfg = load_config(cfg_path)
+    # Save the effective configuration for record-keeping
     save_effective_config(cfg, Path(cfg_path).with_name("effective_config.json"))
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -193,7 +191,7 @@ def main(cfg_path: str):
         ],
     )
 
-    # Loss: NearExpandMaskedCompositeLossV2 (composite of MSE/SSIM/PSNR)
+    # Instantiate composite loss
     lcfg = cfg.get("losses", {})
     criterion = NearExpandMaskedCompositeLossV2(
         thr=float(lcfg.get("expand_thr", 0.8)),
@@ -213,8 +211,7 @@ def main(cfg_path: str):
         eps=float(lcfg.get("eps", 1e-8)),
     ).to(device)
     clamp_pred_gt = bool(lcfg.get("expand_clamp", True))
-
-    # Weight for edge contrast auxiliary loss (default 0.0).
+    # Weight for optional edge contrast loss
     w_edge_contrast = float(lcfg.get("w_edge_contrast", 0.0))
 
     name = str(cfg["train"].get("optimizer", "adamw")).lower()
@@ -264,6 +261,7 @@ def main(cfg_path: str):
 
             proj_cfg = cfg.get("projector", {})
             model_cfg = cfg.get("model", {})
+            # Propagate selected projector options
             setattr(projector, "fbp_filter",  str(proj_cfg.get("fbp_filter", getattr(projector, "fbp_filter", "none"))).lower())
             setattr(projector, "fbp_cutoff",  float(proj_cfg.get("fbp_cutoff", getattr(projector, "fbp_cutoff", 1.0))))
             setattr(projector, "fbp_pad_mode",str(proj_cfg.get("fbp_pad_mode",getattr(projector, "fbp_pad_mode","next_pow2"))).lower())
@@ -337,19 +335,18 @@ def main(cfg_path: str):
                 with autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
                     _, recon = model(S_xaz, v_vol=V_xyz, train_mode=True)
                     R2 = recon[..., 0]  # [B,1,X,Y]
-                    # Clamp prediction and GT for composite loss
                     if clamp_pred_gt:
                         R2c = R2.clamp(0.0, 1.0)
-                        Vc = V_gt.clamp(0.0, 1.0)
+                        Vc  = V_gt.clamp(0.0, 1.0)
                     else:
                         R2c, Vc = R2, V_gt
                     # Composite loss
                     loss_tensor, info = criterion(R2c, Vc)
-                    # Auxiliary edge contrast (batch mean) on raw prediction and GT mask
+                    # Auxiliary edge contrast (batch mean)
                     ec_tensor_batch = edge_contrast_slice_max_torch(
                         R2, (V_gt > 0.0).float(), reduction="batch_mean"
                     )
-                    # Incorporate into total loss (maximize contrast → minimize -contrast)
+                    # Incorporate into total loss (maximize contrast)
                     if w_edge_contrast != 0.0:
                         loss_tensor = loss_tensor + (-w_edge_contrast) * ec_tensor_batch
                     loss = loss_tensor / accum_steps
@@ -442,9 +439,21 @@ def main(cfg_path: str):
             )
 
             val_loss = float(val["loss"])
-            if not (val_loss != val_loss):  # not NaN
+            if not (val_loss != val_loss):
                 if val_loss < best_val:
                     best_val = val_loss
+                    # ------------------------------------------------------------------
+                    # Save checkpoint with geometry info included.
+                    geom_obj = model.projector.geom
+                    geometry_state = {
+                        "vol_shape": geom_obj.vol_shape,
+                        "det_shape": geom_obj.det_shape,
+                        "angles": geom_obj.angles.detach().cpu(),
+                        "voxel_size": geom_obj.voxel_size,
+                        "det_spacing": geom_obj.det_spacing,
+                        "angle_chunk": int(geom_obj.angle_chunk),
+                        "n_steps_cap": int(geom_obj.n_steps_cap),
+                    }
                     state = {
                         "group": g_idx + 1,
                         "epoch": epoch,
@@ -452,15 +461,16 @@ def main(cfg_path: str):
                         "opt_state": opt.state_dict(),
                         "scaler_state": scaler.state_dict(),
                         "config": cfg,
+                        "geometry": geometry_state,
                     }
                     torch.save(state, str(ckpt_dir / "best_shared.pt"))
-
+                    
     csv_logger.close()
 
 
 if __name__ == "__main__":
     import argparse
-    ap = argparse.ArgumentParser(description="Train HDN (slice-wise) with explicit 80/20 split + composite boundary-aware loss.")
+    ap = argparse.ArgumentParser(description="Train HDN (slice‑wise) with explicit 80/20 split + composite boundary‑aware loss.")
     ap.add_argument("--cfg", type=str, default="config.yaml", help="Path to YAML config.")
     args = ap.parse_args()
     main(args.cfg)

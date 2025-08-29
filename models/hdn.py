@@ -42,6 +42,7 @@ from .enc1_1d import Enc1_1D_Angle
 from .enc2_2d import Enc2_2D_Sino
 from .align import Sino2XYAlign
 from .fusion import VoxelCheat2D, Fusion2D
+from .decoder import SinoDecoder2D
 from physics.psf import SeparableGaussianPSF2D
 
 
@@ -57,101 +58,6 @@ def _has_antialias_arg() -> bool:
         return "antialias" in inspect.signature(F.interpolate).parameters
     except Exception:
         return False
-
-
-class SinoDecoder2D(nn.Module):
-    """Decode XY feature maps back into XA sinograms."""
-
-    def __init__(
-        self,
-        in_ch: int,
-        mid_ch: int = 64,
-        depth: int = 2,
-        mode: str = "bilinear",
-        bound: str = "none",
-        antialias: Optional[bool] = None,
-        prefer_gn: int = 8,
-        az_sanity_check: bool = False,
-    ) -> None:
-        super().__init__()
-        self.mode = str(mode).lower()
-        self.bound = str(bound).lower()
-        self.antialias = antialias
-        self._aa_supported = _has_antialias_arg()
-        self.az_sanity_check = bool(az_sanity_check)
-        ch = [in_ch] + [mid_ch] * depth
-        layers = []
-        for i in range(depth):
-            layers.extend(
-                [
-                    nn.Conv2d(ch[i], ch[i + 1], kernel_size=3, stride=1, padding=1, bias=False),
-                    nn.GroupNorm(_gn(ch[i + 1], prefer=prefer_gn), ch[i + 1]),
-                    nn.ReLU(inplace=True),
-                ]
-            )
-        self.mix = nn.Sequential(*layers)
-        self.proj = nn.Conv2d(ch[-1], 1, kernel_size=1, stride=1, padding=0, bias=True)
-
-    def _interpolate_xy_to_xa(self, x: torch.Tensor, tgt_x: int, tgt_a: int) -> torch.Tensor:
-        """Resize from (X,Y) to (X,A) with the specified mode."""
-        size = (int(tgt_x), int(tgt_a))
-        kwargs = {}
-        if self.mode in ("bilinear", "bicubic"):
-            kwargs["align_corners"] = False
-        if self._aa_supported:
-            if self.antialias is None:
-                is_down = (size[0] < x.shape[2]) or (size[1] < x.shape[3])
-                kwargs["antialias"] = bool(is_down)
-            else:
-                kwargs["antialias"] = bool(self.antialias)
-        return F.interpolate(x, size=size, mode=self.mode, **kwargs)
-
-    def _bound_out(self, t: torch.Tensor) -> torch.Tensor:
-        """Apply optional output bounding."""
-        if self.bound == "none":
-            return t
-        if self.bound == "clamp":
-            return t.clamp_(0.0, 1.0)
-        if self.bound == "sigmoid":
-            return torch.sigmoid(t)
-        raise ValueError(f"Unknown bound option: {self.bound}")
-
-    @torch.no_grad()
-    def _sanity_check_az(self, s: torch.Tensor) -> None:
-        """Warn if angle and depth axes appear swapped based on variance."""
-        if (not self.az_sanity_check) or (s.ndim != 5):
-            return
-        _, _, _, A, Z = s.shape
-        if A != Z:
-            return
-        d = s - s.mean(dim=3, keepdim=True)
-        var_A = d.pow(2).mean(dim=3).mean().item()
-        var_Z = d.pow(2).mean(dim=4).mean().item()
-        if var_A < 1e-10 and var_Z > var_A * 10:
-            print(
-                "[warn][SinoDecoder2D] A-collapse vs Z-variance detected. "
-                "Verify: stacking must be along A, not Z."
-            )
-
-    def forward(self, F_xy: torch.Tensor, A: int) -> torch.Tensor:
-        if F_xy.dim() == 5:
-            B, C, X, Y, Z = F_xy.shape
-            x = F_xy.permute(0, 4, 1, 2, 3).contiguous().view(B * Z, C, X, Y)
-        elif F_xy.dim() == 4:
-            B, C, X, Y = F_xy.shape
-            Z = 1
-            x = F_xy.view(B * Z, C, X, Y)
-        else:
-            raise ValueError(f"SinoDecoder2D expects [B,C,X,Y,(Z)], got {F_xy.shape}")
-        x0 = x
-        x = self.mix(x)
-        if x.shape == x0.shape:
-            x = x + x0
-        x = self._interpolate_xy_to_xa(x, X, A)
-        x = self.proj(x)  # [B*Z,1,X,A]
-        sino = x.view(B, Z, 1, X, A).permute(0, 2, 3, 4, 1).contiguous()
-        self._sanity_check_az(sino)
-        return self._bound_out(sino)
 
 
 class HDNSystem(nn.Module):
@@ -219,11 +125,8 @@ class HDNSystem(nn.Module):
             in_ch=self.fusion.out_ch,
             mid_ch=int(sd_cfg.get("mid_ch", 64)),
             depth=int(sd_cfg.get("depth", 2)),
-            mode=str(sd_cfg.get("interp_mode", align_cfg.get("interp_mode", "bilinear"))),
+            interp_mode=str(sd_cfg.get("interp_mode", align_cfg.get("interp_mode", "bilinear"))),
             bound=str(sd_cfg.get("bound", "none")).lower(),
-            antialias=sd_cfg.get("antialias", None),
-            prefer_gn=int(sd_cfg.get("prefer_gn", 8)),
-            az_sanity_check=bool(dbg.get("az_sanity_check", False)),
         )
 
         # PSF
@@ -323,7 +226,7 @@ class HDNSystem(nn.Module):
             fused_xy = self.fusion(f_xy, None)
 
         # Decode to [X,A,Z]
-        sino_hat_xaz = self.sino_dec(fused_xy, A=A)
+        sino_hat_xaz = self.sino_dec(fused_xy, target_A=A)
 
         # Residual skip connection (add input sinogram)
         sino_hat_xaz = sino_hat_xaz + S
