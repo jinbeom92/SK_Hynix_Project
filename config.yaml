@@ -13,7 +13,7 @@ data:
 
 projector:
   method: "joseph3d"
-  fbp_filter: "hamming"       # {"none","ramp","shepp-logan","cosine","hann","hamming"}
+  fbp_filter: "none"       # {"none","ramp","shepp-logan","cosine","hann","hamming"}
   ir_circle: true
   bp_span: "auto"
 
@@ -29,7 +29,7 @@ model:
   align:  { out_ch: 64, depth: 2, interp_mode: "bilinear" }  # Sino→XY align
   cheat2d: { enabled: true, base: 64, depth: 4 }     # (train-only) GT-derived hints
   fusion: { out_ch: 64 }                              # fuse enc/cheat features on XY
-  sino_dec: { mid_ch: 64, depth: 4, interp_mode: "bilinear", bound: "sigmoid" }  # XY→XA
+  sino_dec: { mid_ch: 128, depth: 4, interp_mode: "bilinear", bound: "sigmoid" }  # XY→XA
   clamp_recon: true            # clamp recon to [0,1] before loss/eval (safety)
   ir_impl: "grid"              # projector BP impl: {"grid","interp"}
   ir_interpolation: "linear"   # only used if ir_impl=="interp"
@@ -69,7 +69,7 @@ train:
   amp: true
   amp_dtype: "auto"          # {"bf16","fp16","auto"}
   optimizer: "adamw"         # {"adamw","adafactor"}
-  lr: 3.0e-4
+  lr: 1.0e-3
   weight_decay: 0     # 1.0e-5
   batch_size: 20
   num_workers: 4

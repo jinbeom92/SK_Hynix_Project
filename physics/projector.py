@@ -140,64 +140,69 @@ class JosephProjector3D(BaseProjector3D):
         """
         Differentiable 2D filtered backprojection using grid_sample.
 
-        Takes a sinogram `[N, A]`, optionally pads it to a square if
-        `ir_circle=True`, zero-pads to the next power-of-two along the detector
-        axis, applies a 1D frequency-domain filter, and then performs the
-        inverse Radon transform by bilinearly sampling at coordinates
-        t = y·cosθ − x·sinθ.  The result is scaled by π/(2·A).
+        This implementation:
+        • Pads the detector axis to a circumscribed square when `ir_circle=True`.
+        • Zero‑pads to the next power‑of‑two for FFT, applies a 1D frequency‑domain
+            filter (ramp / Shepp–Logan / cosine / Hamming / Hann / none).
+        • Performs inverse Radon by bilinearly sampling t = y·cosθ − x·sinθ.
+        • Scales the result by π/(2·A).
+        • **Applies a resolution‑based circular mask** when `ir_circle=True`:
+            pixels outside a circle of radius `Y/2` (half the output resolution),
+            centred at `((Y-1)/2, (Y-1)/2)`, are set to zero.
 
-        NOTE: The circular mask follows the ASTRA example's half‑pixel inscribed
-        circle: center at ((Y-1)/2,(Y-1)/2) and radius r = (Y-1)/2.
+        Args:
+            radon_image: 2D sinogram tensor of shape [N, A] (detector, angles).
+
+        Returns:
+            Reconstructed square image tensor [Y, Y] (float dtype preserved).
         """
         device = radon_image.device
         dtype = radon_image.dtype
 
-        # Cast to float32 for FFT operations
+        # Work in float32 for FFT stability
         sino = radon_image.to(torch.float32)
         N, A = sino.shape
 
-        # Pad detector axis to circumscribed square if circle=True
+        # If reconstructing within the circle, first pad detector to circumscribed square
         if self.ir_circle:
             diag = int(math.ceil(math.sqrt(2.0) * N))
             pad = diag - N
             old_center = N // 2
             new_center = diag // 2
             pad_before = new_center - old_center
-            sino = F.pad(sino, (0, 0, pad_before, pad - pad_before))
-            N = sino.shape[0]
+            sino = F.pad(sino, (0, 0, pad_before, pad - pad_before))  # [N', A]
+            N = int(sino.shape[0])
 
-        # Zero-pad to next power-of-two (>=64) along detector axis for FFT
+        # Zero‑pad along detector to next power‑of‑two (>=64) for FFT
         P = max(64, 1 << int(math.ceil(math.log2(2 * N))))
         sino_pad = F.pad(sino, (0, 0, 0, P - N))  # [P, A]
 
-        # 1D frequency-domain filter
+        # 1D frequency‑domain filter along detector (per angle)
         H = self._fourier_filter_torch(P, self.fbp_filter, device=sino_pad.device, dtype=torch.float32)
-        Xf = torch.fft.rfft(sino_pad, dim=0)  # [P_rfft, A]
-        Yf = Xf * H[: Xf.shape[0]].unsqueeze(1)
-        sino_filt = torch.fft.irfft(Yf, n=P, dim=0)[:N, :]  # [N, A]
+        Xf = torch.fft.rfft(sino_pad, dim=0)                          # [P_rfft, A]
+        Yf = Xf * H[: Xf.shape[0]].unsqueeze(1)                       # [P_rfft, A]
+        sino_filt = torch.fft.irfft(Yf, n=P, dim=0)[:N, :]            # [N, A]
 
-        # Output square side
-        if self.ir_circle:
-            Y = N
-        else:
-            Y = int(math.floor((N**2) / 2.0) ** 0.5)
+        # Output side length
+        Y = N if self.ir_circle else int(math.floor((N**2) / 2.0) ** 0.5)
 
-        # --- ASTRA-like pixel-center coordinates (half-pixel offset) ---
-        # Center at ((Y-1)/2, (Y-1)/2), radius r = (Y-1)/2
+        # Coordinate system: pixel centres with half‑pixel offset
         cy = (Y - 1) * 0.5
         cx = (Y - 1) * 0.5
-        r = (Y - 1) * 0.5
+        r = 0.5 * float(Y)  # resolution‑half radius
 
-        # Build sampling grid [A, Y, Y, 2]
+        # Meshgrid (centred)
         yy, xx = torch.meshgrid(
             torch.arange(Y, dtype=torch.float32, device=device) - cy,
             torch.arange(Y, dtype=torch.float32, device=device) - cx,
             indexing="ij",
         )
+
+        # Sampling coordinates for grid_sample
         theta = torch.arange(A, dtype=torch.float32, device=device) * (math.pi / A)
         t = yy.unsqueeze(0) * torch.cos(theta).view(-1, 1, 1) - xx.unsqueeze(0) * torch.sin(theta).view(-1, 1, 1)
 
-        # Normalise detector axis to [-1,1] (pixel centers) and angle axis to [-1,1]
+        # Normalise detector axis to [-1, 1] (pixel centres), angle axis to [-1, 1]
         t_norm = (2.0 * (t + (N - 1) / 2.0) / max(1, N - 1)) - 1.0
         if A > 1:
             a_norm = (2.0 * torch.arange(A, dtype=torch.float32, device=device) / (A - 1)) - 1.0
@@ -206,30 +211,28 @@ class JosephProjector3D(BaseProjector3D):
         grid = torch.stack(
             [
                 a_norm.view(-1, 1, 1).expand(-1, Y, Y),  # x = angle axis
-                t_norm,                                   # y = detector axis
+                t_norm,                                  # y = detector axis
             ],
             dim=-1,
         )  # [A, Y, Y, 2]
 
-        # Sample sinogram using grid_sample
+        # Sample filtered sinogram and accumulate over angles
         inp = (
             sino_filt.permute(1, 0)   # [A, N]
                 .unsqueeze(1)         # [A, 1, N]
                 .unsqueeze(-1)        # [A, 1, N, 1]
                 .expand(-1, 1, N, A)  # [A, 1, N, A]
         )
-        recon_per_angle = F.grid_sample(
-            inp, grid, mode="bilinear", padding_mode="zeros", align_corners=True
-        )  # [A, 1, Y, Y]
+        recon_per_angle = F.grid_sample(inp, grid, mode="bilinear", padding_mode="zeros", align_corners=True)  # [A,1,Y,Y]
         recon = recon_per_angle.sum(dim=0)[0]  # [Y, Y]
 
-        # Scale by π/(2·A)
+        # Normalisation π/(2·A)
         recon *= (math.pi / (2.0 * A))
 
-        # Apply ASTRA-style half‑pixel inscribed circular mask
+        # Resolution‑half circular mask (apply when ir_circle=True)
         if self.ir_circle:
-            outside = (xx**2 + yy**2) > (r * r)
-            recon = recon.masked_fill(outside, 0.0)
+            mask = (xx**2 + yy**2) <= (r * r)
+            recon = recon * mask.to(recon.dtype)
 
         return recon.to(dtype)
 
